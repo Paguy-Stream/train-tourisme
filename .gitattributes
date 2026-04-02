@@ -1,10 +1,6 @@
-# Créer .gitattributes
-@"
-# Fichiers binaires — ne pas toucher au contenu
-*.parquet binary
-*.pkl     binary
-*.pkl.gz  binary
-*.gz      binary
-*.db      binary
-"@ | Out-File -FilePath .gitattributes -Encoding utf8
+﻿*.parquet binary
+*.pkl binary
+*.pkl.gz binary
+*.gz binary
+*.db binary
 data/raw/amenagements_cyclables.parquet !text !filter !merge !diff
