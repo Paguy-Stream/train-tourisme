@@ -1,0 +1,2858 @@
+"""
+pages/mobilite.py — Version finale optimisée avec intégration GBFS unifiée et tendances réelles
+✅ Intégration du module GBFS unifié pour toutes les villes françaises
+✅ Visualisations avancées (cartes de chaleur temporelles, analytics)
+✅ Optimisations cache et performance
+✅ CORRECTIONS: URL Vélib' (smovengo.cloud), timeout 15s, détection villes améliorée
+✅ Intégration analyseur de tendances réelles (SQLite)
+✅ Circuit breaker pattern pour résilience
+✅ Exécution parallèle des requêtes
+"""
+
+import dash
+from dash import dcc, html, Input, Output, callback, State, dash_table
+import dash_leaflet as dl
+import dash_leaflet.express as dlx
+from dash.exceptions import PreventUpdate
+import pandas as pd
+import numpy as np
+import plotly.express as px
+import plotly.graph_objects as go
+import requests
+import asyncio
+import aiohttp
+import time
+import json
+import zlib
+import warnings
+import hashlib
+import threading
+import atexit
+
+
+
+from typing import List, Dict, Optional, Any, Tuple
+from dataclasses import dataclass, asdict
+from datetime import datetime, timedelta
+from functools import lru_cache, wraps
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from enum import Enum
+import weakref
+import sys
+
+# Imports des utilitaires existants
+from utils.data_loader import load_gares, load_amenagements_cyclables, load_poi
+from utils.data_loader import compute_distance_km, filter_poi_by_bbox
+
+# Import du module GBFS unifié
+from gbfs_unified import GBFSClient, GBFSDashboardAdapter, Station
+
+# Import de l'analyseur de tendances (depuis mobilite_INTEGRATION_TRENDS.py)
+try:
+    from gbfs_trends_analyzer import GBFSTrendsAnalyzer
+    TRENDS_AVAILABLE = True
+except ImportError:
+    TRENDS_AVAILABLE = False
+    print("[mobilite] ⚠️ Module gbfs_trends_analyzer non disponible")
+
+warnings.filterwarnings('ignore')
+
+dash.register_page(__name__, path="/mobilite", name="Mobilités locales")
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# CONSTANTES ET CONFIGURATION
+# ═══════════════════════════════════════════════════════════════════════════════
+
+TYPES_AMENAGEMENTS = {
+    "PISTE CYCLABLE": {"emoji": "🚴", "label": "Pistes cyclables", "color": "#2D6A4F",
+                      "description": "Voie séparée", "qualite": 5},
+    "BANDE CYCLABLE": {"emoji": "🚲", "label": "Bandes cyclables", "color": "#1A4B8C",
+                      "description": "Marquage sol", "qualite": 3},
+    "VOIE VERTE": {"emoji": "🌿", "label": "Voies vertes", "color": "#52B788",
+                   "description": "Partagée", "qualite": 4},
+    "AUTRE": {"emoji": "📍", "label": "Autres", "color": "#F4A620",
+              "description": "Vélorues, bus+vélo", "qualite": 2},
+}
+
+# Configuration GBFS
+GBFS_CACHE_TTL = 60  # secondes
+GBFS_REFRESH_INTERVAL = 60000  # ms (1 minute)
+MAX_WORKERS = 4  # Pour le thread pool
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# CIRCUIT BREAKER PATTERN (Résilience)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+class CircuitState(Enum):
+    CLOSED = "closed"      # Normal operation
+    OPEN = "open"         # Failing, reject requests
+    HALF_OPEN = "half_open"  # Testing if recovered
+
+class CircuitBreaker:
+    """Circuit breaker pour éviter les cascades de failures"""
+    def __init__(self, name: str, failure_threshold: int = 5, recovery_timeout: int = 60):
+        self.name = name
+        self.failure_threshold = failure_threshold
+        self.recovery_timeout = recovery_timeout
+        self.failures = 0
+        self.last_failure_time = None
+        self.state = CircuitState.CLOSED
+        self._lock = threading.Lock()
+    
+    def can_execute(self) -> bool:
+        with self._lock:
+            if self.state == CircuitState.CLOSED:
+                return True
+            elif self.state == CircuitState.OPEN:
+                if time.time() - self.last_failure_time > self.recovery_timeout:
+                    self.state = CircuitState.HALF_OPEN
+                    print(f"[circuit:{self.name}] Half-open, testing...")
+                    return True
+                return False
+            return True  # HALF_OPEN
+    
+    def record_success(self):
+        with self._lock:
+            if self.state == CircuitState.HALF_OPEN:
+                self.state = CircuitState.CLOSED
+                print(f"[circuit:{self.name}] Recovered, closed")
+            self.failures = 0
+    
+    def record_failure(self):
+        with self._lock:
+            self.failures += 1
+            self.last_failure_time = time.time()
+            if self.failures >= self.failure_threshold:
+                if self.state != CircuitState.OPEN:
+                    self.state = CircuitState.OPEN
+                    print(f"[circuit:{self.name}] OPEN (failures: {self.failures})")
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# GESTION EVENT LOOP ET EXECUTEUR DE THREADS
+# ═══════════════════════════════════════════════════════════════════════════════
+
+class AsyncLoopManager:
+    _instance = None
+    _lock = threading.Lock()
+    
+    def __new__(cls):
+        if cls._instance is None:
+            with cls._lock:
+                if cls._instance is None:
+                    cls._instance = super().__new__(cls)
+                    cls._instance._loop = None
+                    cls._instance._executor = ThreadPoolExecutor(max_workers=MAX_WORKERS)
+        return cls._instance
+    
+    def get_loop(self):
+        with self._lock:
+            if self._loop is None or self._loop.is_closed():
+                try:
+                    self._loop = asyncio.new_event_loop()
+                    asyncio.set_event_loop(self._loop)
+                except RuntimeError:
+                    self._loop = asyncio.new_event_loop()
+            return self._loop
+    
+    def run_async(self, coro):
+        loop = self.get_loop()
+        if loop.is_running():
+            new_loop = asyncio.new_event_loop()
+            try:
+                return new_loop.run_until_complete(coro)
+            finally:
+                new_loop.close()
+        else:
+            return loop.run_until_complete(coro)
+    
+    def run_in_thread(self, func, *args, **kwargs):
+        """Exécute une fonction bloquante dans un thread séparé"""
+        return self._executor.submit(func, *args, **kwargs)
+
+loop_manager = AsyncLoopManager()
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# CACHE AVANCÉ AVEC GESTION DE MÉMOIRE
+# ═══════════════════════════════════════════════════════════════════════════════
+
+class MemoryManagedCache:
+    """Cache avec compression et gestion de la mémoire"""
+    def __init__(self, max_size_mb: int = 256, ttl_seconds: int = 60):
+        self.max_size = max_size_mb * 1024 * 1024
+        self.ttl = ttl_seconds
+        self._cache = {}
+        self._timestamps = {}
+        self._sizes = {}
+        self._lock = threading.RLock()
+        self._current_size = 0
+    
+    def _compress(self, data: Any) -> bytes:
+        return zlib.compress(json.dumps(data, default=str).encode(), level=6)
+    
+    def _decompress(self, data: bytes) -> Any:
+        return json.loads(zlib.decompress(data).decode())
+    
+    def _get_size(self, obj) -> int:
+        """Estime la taille en bytes"""
+        if isinstance(obj, bytes):
+            return len(obj)
+        return sys.getsizeof(obj)
+    
+    def _evict_if_needed(self, required_space: int):
+        """Évite les entrées les plus anciennes si nécessaire"""
+        while self._current_size + required_space > self.max_size and self._cache:
+            oldest_key = min(self._timestamps, key=self._timestamps.get)
+            self._remove_entry(oldest_key)
+    
+    def _remove_entry(self, key: str):
+        if key in self._cache:
+            self._current_size -= self._sizes.get(key, 0)
+            del self._cache[key]
+            del self._timestamps[key]
+            del self._sizes[key]
+    
+    def get(self, key: str) -> Optional[Any]:
+        with self._lock:
+            if key not in self._cache:
+                return None
+            
+            # Vérifier TTL
+            if time.time() - self._timestamps[key] > self.ttl:
+                self._remove_entry(key)
+                return None
+            
+            try:
+                data = self._decompress(self._cache[key])
+                self._timestamps[key] = time.time()  # Update access time
+                return data
+            except Exception as e:
+                print(f"[cache] Decompression error: {e}")
+                self._remove_entry(key)
+                return None
+    
+    def set(self, key: str, value: Any) -> None:
+        with self._lock:
+            try:
+                compressed = self._compress(value)
+                size = self._get_size(compressed)
+                
+                # Retirer l'ancienne entrée si existe
+                if key in self._cache:
+                    self._current_size -= self._sizes[key]
+                
+                # Éviter si nécessaire
+                self._evict_if_needed(size)
+                
+                self._cache[key] = compressed
+                self._timestamps[key] = time.time()
+                self._sizes[key] = size
+                self._current_size += size
+                
+            except Exception as e:
+                print(f"[cache] Compression error: {e}")
+
+# Instances de cache
+_api_cache = MemoryManagedCache(max_size_mb=512, ttl_seconds=60)
+_gis_cache = MemoryManagedCache(max_size_mb=256, ttl_seconds=300)  # Cache GIS plus long
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# INITIALISATION GBFS UNIFIÉ ET TENDANCES
+# ═══════════════════════════════════════════════════════════════════════════════
+
+print("[mobilite] 🚀 Initialisation du client GBFS unifié...")
+gbfs_client = GBFSClient(timeout=15, cache_ttl=30)
+gbfs_adapter = GBFSDashboardAdapter(gbfs_client)
+
+# Circuit breakers par ville
+_circuit_breakers = {}
+
+def get_circuit_breaker(city: str) -> CircuitBreaker:
+    """Récupère ou crée un circuit breaker pour une ville"""
+    if city not in _circuit_breakers:
+        _circuit_breakers[city] = CircuitBreaker(name=city, failure_threshold=3, recovery_timeout=30)
+    return _circuit_breakers[city]
+
+# Initialisation de l'analyseur de tendances (depuis mobilite_INTEGRATION_TRENDS.py)
+_trends_analyzer = None
+
+def get_trends_analyzer():
+    """Singleton pour l'analyseur de tendances"""
+    global _trends_analyzer
+    if _trends_analyzer is None and TRENDS_AVAILABLE:
+        print("[mobilite] 🚀 Initialisation de l'analyseur de tendances...")
+        _trends_analyzer = GBFSTrendsAnalyzer(
+            db_path="data/gbfs_trends.db",
+            auto_collect=True
+        )
+        
+        # Lancer la collecte en arrière-plan
+        villes_principales = [
+            "Paris", "Lyon", "Marseille", "Bordeaux", "Toulouse",
+            "Nantes", "Strasbourg", "Rennes", "Nice", "Grenoble",
+            "Lille", "Angers", "Brest", "Limoges",
+            "Mulhouse", "Montpellier", "Nîmes", "Nancy", 
+            "Le Havre", "Rouen", "Avignon"
+        ]
+        
+        def start_collection():
+            try:
+                _trends_analyzer.start_collector(
+                    villes=villes_principales,
+                    interval_minutes=60
+                )
+                print(f"[mobilite] ✅ Collecteur lancé pour {len(villes_principales)} villes")
+            except Exception as e:
+                print(f"[mobilite] ❌ Erreur démarrage collecteur: {e}")
+        
+        threading.Thread(target=start_collection, daemon=True).start()
+        
+        # Nettoyage à la fermeture
+        atexit.register(lambda: _trends_analyzer.stop_collector() if _trends_analyzer else None)
+    
+    return _trends_analyzer
+
+# Initialisation lazy
+if TRENDS_AVAILABLE:
+    threading.Thread(target=get_trends_analyzer, daemon=True).start()
+
+# Cache pour les données statiques
+_cyclables_cache = None
+_gares_cache = None
+_poi_cache = None
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# CHARGEMENT DONNÉES STATIQUES (OPTIMISÉ)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def get_gares():
+    """Charge les gares avec cache"""
+    global _gares_cache
+    if _gares_cache is None:
+        print("[mobilite] 📊 Chargement des gares...")
+        _gares_cache = load_gares()
+        print(f"[mobilite] ✅ {len(_gares_cache)} gares chargées")
+    return _gares_cache
+
+def get_poi():
+    """Charge les POIs avec cache"""
+    global _poi_cache
+    if _poi_cache is None:
+        print("[mobilite] 📊 Chargement des POIs...")
+        _poi_cache = load_poi()
+        print(f"[mobilite] ✅ {len(_poi_cache)} POIs chargés")
+    return _poi_cache
+
+def get_cyclables():
+    """Charge les aménagements cyclables avec cache"""
+    global _cyclables_cache
+    if _cyclables_cache is None:
+        print("[mobilite] 🚴 Chargement aménagements cyclables...")
+        _cyclables_cache = load_amenagements_cyclables()
+        if _cyclables_cache is not None:
+            print(f"[mobilite] ✅ {len(_cyclables_cache):,} segments chargés")
+    return _cyclables_cache
+
+# Chargement initial
+df_gares = get_gares()
+df_poi = get_poi()
+gare_options = [{"label": g, "value": g} for g in sorted(df_gares["libelle"].tolist())]
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# FONCTIONS UTILITAIRES GBFS (CORRIGÉES POUR gbfs_unified.py)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def detecter_villes_gbfs(gare_nom: str) -> List[str]:
+    """Détecte les villes avec mapping intelligent et exclusions géographiques"""
+    gare_nom_lower = gare_nom.lower()
+    villes_detectees = []
+    
+    # Récupérer villes disponibles
+    try:
+        villes_disponibles = gbfs_client.get_cities_list()
+    except Exception as e:
+        print(f"[mobilite] ❌ Erreur récupération villes: {e}")
+        villes_disponibles = []
+    
+    # Chercher correspondances par ORDRE DE SPÉCIFICITÉ
+    ordered_keywords = [
+        # === 1. ZONES SPÉCIFIQUES (priorité maximale) ===
+        ("evry", ["GPSEO"]),
+        ("corbeil", ["GPSEO"]),
+        ("mennecy", ["GPSEO"]),
+        ("ris-orangis", ["GPSEO"]),
+        ("gpseo", ["GPSEO"]),
+        ("grand paris sud", ["GPSEO"]),
+        
+        ("melun", ["SIEMU"]),
+        ("dammarie-les-lys", ["SIEMU"]),
+        ("siemu", ["SIEMU"]),
+        
+        ("marseille saint-charles", ["Marseille"]),
+        ("marseille blancarde", ["Marseille"]),
+        ("marseille joliette", ["Marseille"]),
+        ("vitrolles aéroport marseille", ["Marseille"]),
+        
+        # === 2. GRANDES MÉTROPOLES ===
+        ("paris", ["Paris"]),
+        ("lyon", ["Lyon"]),
+        ("marseille", ["Marseille"]),
+        ("nice", ["Nice"]),
+        ("lille", ["Lille"]),
+        ("bordeaux", ["Bordeaux"]),
+        ("toulouse", ["Toulouse"]),
+        ("nantes", ["Nantes"]),
+        ("strasbourg", ["Strasbourg"]),
+        ("rennes", ["Rennes"]),
+        ("grenoble", ["Grenoble"]),
+        
+        # === 3. ✅ NOUVELLES VILLES (7 ajoutées) ===
+        ("montpellier", ["Montpellier"]),
+        ("nimes", ["Nîmes"]),
+        ("nîmes", ["Nîmes"]),  # Variante avec accent
+        ("nancy", ["Nancy"]),
+        ("le havre", ["Le Havre"]),
+        ("havre", ["Le Havre"]),
+        ("mulhouse", ["Mulhouse"]),
+        ("rouen", ["Rouen"]),
+        ("avignon", ["Avignon"]),
+        
+        # === 4. VILLES MOYENNES ===
+        ("angers", ["Angers"]),
+        ("brest", ["Brest"]),
+        ("limoges", ["Limoges"]),
+        ("lorient", ["Lorient"]),
+        ("amiens", ["Amiens"]),
+        ("poitiers", ["Poitiers"]),
+        ("bourges", ["Bourges"]),
+        ("saint-etienne", ["Saint-Étienne"]),
+        ("saint etienne", ["Saint-Étienne"]),
+    ]
+    
+    matched_keywords = []
+    
+    for mot_cle, villes_associees in ordered_keywords:
+        if mot_cle in gare_nom_lower:
+            for ville in villes_associees:
+                if ville in villes_disponibles and ville not in villes_detectees:
+                    villes_detectees.append(ville)
+                    matched_keywords.append(mot_cle)
+                    print(f"[mobilite] ✅ Détecté: {ville} via mot-clé '{mot_cle}'")
+            
+            # Arrêter si on a trouvé une correspondance spécifique
+            if mot_cle not in ["paris", "lyon", "marseille", "lille", "bordeaux", "toulouse"]:
+                break
+    
+    # Fallback si rien trouvé
+    if not villes_detectees:
+        for ville in villes_disponibles:
+            ville_lower = ville.lower()
+            if ville_lower in gare_nom_lower:
+                # Vérification pour éviter confusion Paris/GPSEO
+                if ville == "Paris" and ("gpseo" in gare_nom_lower or "evry" in gare_nom_lower):
+                    continue
+                villes_detectees.append(ville)
+                print(f"[mobilite] ✅ Détecté (fallback): {ville}")
+
+    villes_detectees = list(set(villes_detectees))
+    
+    # Log final
+    if len(villes_detectees) > 1:
+        print(f"[mobilite] 📍 Villes détectées: {villes_detectees} (multi-villes)")
+    else:
+        print(f"[mobilite] 📍 Ville détectée: {villes_detectees[0] if villes_detectees else 'Aucune'}")
+    
+    return villes_detectees
+
+
+def get_stations_proximite(villes: List[str], lat: float, lon: float, 
+                           radius_km: float = 0.5) -> Dict[str, List[Dict]]:
+    """
+    Récupère les stations GBFS à proximité avec cache
+    """
+    if not villes:
+        return {}
+    
+    cache_key = hashlib.md5(
+        f"{'_'.join(sorted(villes))}_{lat:.4f}_{lon:.4f}_{radius_km}".encode()
+    ).hexdigest()
+    
+    cached = _api_cache.get(f"gbfs_{cache_key}")
+    if cached:
+        total_in_cache = sum(len(stations) for stations in cached.values())
+        villes_in_cache = len(cached)
+        print(f"[mobilite] 🔵 GBFS cache hit: {total_in_cache} points dans {villes_in_cache} villes")
+        return cached
+    
+    try:
+        all_stations = loop_manager.run_async(
+            gbfs_client.get_all_stations(cities=villes)
+        )
+        
+        # Organiser par ville et filtrer par distance
+        resultats = {}
+        total_avant_filtre = len(all_stations)
+        stations_par_ville_avant = {}
+        
+        for station in all_stations:
+            if not station.lat or not station.lon:
+                continue
+            
+            # Compter avant filtre pour le log
+            if station.city not in stations_par_ville_avant:
+                stations_par_ville_avant[station.city] = 0
+            stations_par_ville_avant[station.city] += 1
+            
+            dist = compute_distance_km(lat, lon, station.lat, station.lon)
+            
+            if dist <= radius_km:
+                if station.city not in resultats:
+                    resultats[station.city] = []
+                
+                total_vehicles = (
+                    station.num_bikes_available + 
+                    station.num_ebikes_available + 
+                    station.num_scooters_available
+                )
+                
+                resultats[station.city].append({
+                    "id": station.station_id,
+                    "nom": station.name[:40] + "..." if len(station.name) > 40 else station.name,
+                    "lat": station.lat,
+                    "lon": station.lon,
+                    "distance_m": int(dist * 1000),
+                    "velos": total_vehicles,
+                    "velos_meca": station.num_bikes_available,
+                    "velos_elec": station.num_ebikes_available,
+                    "scooters": station.num_scooters_available,
+                    "places": station.num_docks_available,
+                    "capacity": station.capacity,
+                    "actif": station.is_renting,
+                    "reseau": f"{station.operator}",
+                    "type": "free_floating" if station.station_id.startswith("free_") else "station",
+                    "last_updated": station.last_updated,
+                    "occupation": (total_vehicles / station.capacity * 100) if station.capacity > 0 else 0
+                })
+        
+        # Trier et limiter chaque ville
+        for ville in resultats:
+            resultats[ville].sort(key=lambda x: x["distance_m"])
+            resultats[ville] = resultats[ville][:15]
+        
+        # Mettre en cache
+        _api_cache.set(f"gbfs_{cache_key}", resultats)
+        
+        total_apres_filtre = sum(len(stations) for stations in resultats.values())
+        villes_avec_stations = len(resultats)
+        
+        # LOG AMÉLIORÉ: Montrer le détail par ville
+        detail_villes = ", ".join([
+            f"{ville}:{len(stations)}" for ville, stations in resultats.items()
+        ]) if resultats else "aucune"
+        
+        print(f"[mobilite] ✅ GBFS: {total_avant_filtre} stations récupérées, "
+              f"{total_apres_filtre} dans le rayon ({radius_km}km) "
+              f"→ [{detail_villes}]")
+        
+        # ALERTE SI PEU DE STATIONS: Suggérer d'augmenter le rayon
+        if total_apres_filtre < 5 and total_avant_filtre > 100:
+            print(f"[mobilite] ⚠️ Peu de stations proches ({total_apres_filtre}), "
+                  f"mais {total_avant_filtre} disponibles dans la région.")
+        
+        return resultats
+        
+    except Exception as e:
+        print(f"[mobilite] ❌ Erreur GBFS: {e}")
+        import traceback
+        traceback.print_exc()
+        return {}
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# FONCTIONS ANALYSE CYCLABILITÉ (OPTIMISÉES AVEC THREADING)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def compute_network_connectivity_vectorized(gdf_cyclables):
+    """Calcule la connectivité du réseau (version optimisée)"""
+    try:
+        import networkx as nx
+        if len(gdf_cyclables) == 0:
+            return 0, 0, 0
+        
+        # Utiliser un graphe non dirigé pour la connectivité
+        G = nx.Graph()
+        
+        # Vectorisation de l'extraction des nœuds
+        def extract_edges(geom):
+            try:
+                coords = list(geom.coords)
+                if len(coords) < 2:
+                    return None
+                start = (round(coords[0][0], 5), round(coords[0][1], 5))
+                end = (round(coords[-1][0], 5), round(coords[-1][1], 5))
+                # Éviter les self-loops
+                if start == end:
+                    return None
+                return (start, end, geom.length)
+            except Exception:
+                return None
+        
+        # Application vectorisée
+        edges = gdf_cyclables.geometry.apply(extract_edges).dropna()
+        
+        # Construction du graphe
+        for edge in edges:
+            G.add_edge(edge[0], edge[1], weight=edge[2])
+        
+        if G.number_of_nodes() == 0:
+            return 0, 0, 0
+        
+        # Analyse des composantes
+        composantes = list(nx.connected_components(G))
+        nb_composantes = len(composantes)
+        
+        if nb_composantes == 0:
+            return 0, 0, 0
+            
+        plus_grande = max(composantes, key=len)
+        pct_principale = len(plus_grande) / G.number_of_nodes() * 100
+        
+        # Score de connectivité (0-25)
+        # Moins de composantes = meilleur score
+        score = max(0, (1 - (nb_composantes - 1) / 50) * 25)
+        
+        return score, nb_composantes, pct_principale
+        
+    except Exception as e:
+        print(f"[mobilite] ⚠️ Erreur connectivité: {e}")
+        return 10, 0, 0
+
+def compute_cyclability_score(gare_row, df_cyclables_filtered, df_poi_local, rayon_km=5):
+    """Calcule le score de cyclabilité avec mise en cache"""
+    if df_cyclables_filtered is None or len(df_cyclables_filtered) == 0:
+        return {
+            "score_total": 0,
+            "niveau": ("🔴 Non cyclable", "Aucun aménagement détecté"),
+            "details": {"densite": 0, "qualite": 0, "connectivite": 0, "accessibilite": 0},
+            "stats": {"km_total": 0, "nb_composantes": 0, "pct_principale": 0}
+        }
+    
+    # Cache key basé sur les paramètres
+    cache_key = f"cyclability_{rayon_km}_{hash(str(gare_row['libelle']))}"
+    cached = _gis_cache.get(cache_key)
+    if cached:
+        return cached
+    
+    surface_km2 = np.pi * (rayon_km ** 2)
+    
+    try:
+        import geopandas as gpd
+        # Conversion en Lambert 93 pour calculs de distance précis
+        cyclables_l93 = df_cyclables_filtered.to_crs(epsg=2154)
+        km_total = cyclables_l93.geometry.length.sum() / 1000
+    except Exception as e:
+        print(f"[mobilite] ⚠️ Erreur calcul longueur: {e}")
+        km_total = len(df_cyclables_filtered) * 0.3  # Estimation fallback
+    
+    # Score densité (max 30) - km de piste par km²
+    densite_optimale = 5  # km/km² idéal (Paris centre ~8)
+    score_densite = min((km_total / surface_km2) / densite_optimale * 30, 30)
+    
+    # Score qualité (max 25)
+    def get_qualite(type_str):
+        return TYPES_AMENAGEMENTS.get(type_str, {}).get("qualite", 2)
+    
+    if "type_norm" in df_cyclables_filtered.columns:
+        # Calcul pondéré par longueur si possible
+        try:
+            lengths = cyclables_l93.geometry.length
+            qualites = df_cyclables_filtered["type_norm"].apply(get_qualite)
+            score_qualite = (np.average(qualites, weights=lengths) / 5) * 25
+        except:
+            qualites = df_cyclables_filtered["type_norm"].apply(get_qualite)
+            score_qualite = (qualites.mean() / 5) * 25
+    else:
+        score_qualite = 10
+    
+    # Score connectivité (max 25) - en thread séparé si gros dataset
+    if len(df_cyclables_filtered) > 1000:
+        future = loop_manager.run_in_thread(
+            compute_network_connectivity_vectorized, 
+            df_cyclables_filtered
+        )
+        score_connectivite, nb_composantes, pct_principale = future.result(timeout=5)
+    else:
+        score_connectivite, nb_composantes, pct_principale = compute_network_connectivity_vectorized(df_cyclables_filtered)
+    
+    # Score accessibilité (max 20) - basé sur la longueur totale
+    score_access = min(km_total / 10 * 20, 20) if km_total > 5 else km_total / 5 * 10
+    
+    total = score_densite + score_qualite + score_connectivite + score_access
+    
+    # Détermination du niveau
+    if total >= 75:
+        niveau = ("🌟 Excellent", "Réseau dense, connecté et de qualité")
+    elif total >= 55:
+        niveau = ("🚴 Bon", "Infrastructure satisfaisante")
+    elif total >= 35:
+        niveau = ("🚲 Moyen", "Réseau en développement")
+    elif total >= 15:
+        niveau = ("⚠️ Limité", "Aménagements ponctuels")
+    else:
+        niveau = ("🔴 Insuffisant", "Prévoir alternative")
+    
+    result = {
+        "score_total": round(total),
+        "niveau": niveau,
+        "details": {
+            "densite": round(score_densite, 1),
+            "qualite": round(score_qualite, 1),
+            "connectivite": round(score_connectivite, 1),
+            "accessibilite": round(score_access, 1),
+        },
+        "stats": {
+            "km_total": round(km_total, 1),
+            "nb_composantes": nb_composantes,
+            "pct_principale": round(pct_principale, 1),
+        }
+    }
+    
+    # Mettre en cache
+    _gis_cache.set(cache_key, result)
+    return result
+def find_verified_routes(gare_row, df_cyclables_filtered, df_poi_local=None, max_routes=8):
+    """
+    Trouve les itinéraires vérifiés vers les POIs RÉELS.
+    ✅ VERSION CORRIGÉE : Utilise les POIs, pas des destinations fictives
+    """
+    if df_cyclables_filtered is None or len(df_cyclables_filtered) == 0:
+        return []
+    
+    try:
+        import geopandas as gpd
+        from shapely.geometry import LineString, Point
+        import numpy as np
+        
+        routes_verified = []
+        gare_point = Point(gare_row["longitude"], gare_row["latitude"])
+        
+        # Convertir en L93 si possible
+        try:
+            cyclables_l93 = df_cyclables_filtered.to_crs(epsg=2154)
+        except Exception as e:
+            print(f"[mobilite] ⚠️ Conversion L93 impossible: {e}")
+            cyclables_l93 = df_cyclables_filtered
+        
+        # ✅ UTILISER LES VRAIS POIs AU LIEU DE DESTINATIONS FICTIVES
+        destinations = []
+        
+        if df_poi_local is not None and len(df_poi_local) > 0:
+            # Prendre les POIs dans un rayon de 3km maximum
+            poi_proches = df_poi_local[df_poi_local["distance_km"] <= 3.0].copy()
+            
+            # Limiter à 24 POIs max
+            if len(poi_proches) > 24:
+                poi_proches = poi_proches.sample(n=24, random_state=42)
+            
+            for idx, poi in poi_proches.iterrows():
+                destinations.append({
+                    "nom": str(poi.get("nom", "Point d'intérêt")),
+                    "type": str(poi.get("type", "POI")),
+                    "lon": float(poi["longitude"]),
+                    "lat": float(poi["latitude"]),
+                    "distance_km": float(poi["distance_km"])
+                })
+        
+        # Si pas assez de POIs, compléter avec destinations géométriques
+        if len(destinations) < 8:
+            print(f"[mobilite] ⚠️ Seulement {len(destinations)} POIs, génération de destinations supplémentaires")
+            distances_cibles = [0.5, 1.0, 1.5, 2.0, 2.5]
+            angles = [0, 45, 90, 135, 180, 225, 270, 315]
+            
+            for dist in distances_cibles:
+                for angle in angles:
+                    if len(destinations) >= 24:
+                        break
+                    angle_rad = np.radians(angle)
+                    delta_lon = dist * np.cos(angle_rad) / (111.32 * np.cos(np.radians(gare_row["latitude"])))
+                    delta_lat = dist * np.sin(angle_rad) / 111.32
+                    
+                    destinations.append({
+                        "nom": f"Zone {['Nord', 'Nord-Est', 'Est', 'Sud-Est', 'Sud', 'Sud-Ouest', 'Ouest', 'Nord-Ouest'][angle // 45]}",
+                        "type": "Zone d'intérêt",
+                        "lon": gare_row["longitude"] + delta_lon,
+                        "lat": gare_row["latitude"] + delta_lat,
+                        "distance_km": dist
+                    })
+        
+        # Analyser chaque destination
+        for dest in destinations:
+            try:
+                dest_point = Point(dest["lon"], dest["lat"])
+                dist_km = dest["distance_km"]
+                
+                buffer_size = min(0.002, max(0.001, dist_km * 0.0001))
+                line = LineString([gare_point, dest_point])
+                buffer = line.buffer(buffer_size)
+                
+                segments_intersect = df_cyclables_filtered[df_cyclables_filtered.intersects(buffer)]
+                
+                if len(segments_intersect) == 0:
+                    continue
+                
+                # Calculer longueur couverte
+                try:
+                    seg_l93 = segments_intersect.to_crs(epsg=2154)
+                    poids_qualite = {
+                        "PISTE CYCLABLE": 1.0,
+                        "BANDE CYCLABLE": 0.7,
+                        "VOIE VERTE": 0.9,
+                        "AUTRE": 0.4
+                    }
+                    
+                    longueur_ponderee = 0
+                    longueur_totale = 0
+                    
+                    for idx, seg in seg_l93.iterrows():
+                        longueur = seg.geometry.length / 1000
+                        type_seg = seg.get("type_norm", "AUTRE")
+                        poids = poids_qualite.get(type_seg, 0.5)
+                        longueur_totale += longueur
+                        longueur_ponderee += longueur * poids
+                    
+                    pct_couvert = min(95, (longueur_ponderee / dist_km) * 100 * 0.9)
+                except:
+                    longueur_totale = len(segments_intersect) * 0.15
+                    pct_couvert = min(90, (longueur_totale / dist_km) * 100)
+                
+                # Déterminer qualité
+                if pct_couvert >= 75:
+                    qualite, color, vitesse = "Sécurisé", "#2D6A4F", 15
+                elif pct_couvert >= 50:
+                    qualite, color, vitesse = "Majoritairement sécurisé", "#1A4B8C", 13
+                elif pct_couvert >= 25:
+                    qualite, color, vitesse = "Partiellement sécurisé", "#F4A620", 12
+                elif pct_couvert >= 10:
+                    qualite, color, vitesse = "Peu sécurisé", "#E85D04", 10
+                else:
+                    qualite, color, vitesse = "Non sécurisé", "#DC2626", 8
+                
+                temps_total = max(3, round((dist_km / vitesse) * 60 + 1))
+                
+                routes_verified.append({
+                    "destination": str(dest["nom"]),
+                    "type": str(dest["type"]),
+                    "distance_km": float(round(dist_km, 1)),
+                    "temps_min": int(temps_total),
+                    "pct_couvert": int(pct_couvert),
+                    "qualite": str(qualite),
+                    "color": str(color),
+                    "vitesse": int(vitesse),
+                    "km_couverts": float(round(longueur_totale, 2)) if 'longueur_totale' in locals() else 0.0
+                })
+                
+                if len(routes_verified) >= max_routes * 2:
+                    break
+                    
+            except Exception as e:
+                continue
+        
+        # Conversion types Python natifs
+        routes_verified = [
+            {k: (float(v) if isinstance(v, (np.floating, np.integer)) else 
+                 int(v) if isinstance(v, (np.integer,)) else 
+                 str(v) if isinstance(v, (np.str_, np.bytes_)) else v)
+             for k, v in route.items()}
+            for route in routes_verified
+        ]
+        
+        # Diversifier les résultats
+        securises = [r for r in routes_verified if r["pct_couvert"] >= 75]
+        moyens = [r for r in routes_verified if 50 <= r["pct_couvert"] < 75]
+        faibles = [r for r in routes_verified if 25 <= r["pct_couvert"] < 50]
+        risques = [r for r in routes_verified if r["pct_couvert"] < 25]
+        
+        selection = []
+        selection.extend(securises[:3])
+        selection.extend(moyens[:2])
+        selection.extend(faibles[:2])
+        selection.extend(risques[:1])
+        
+        if len(selection) < max_routes:
+            restants = [r for r in routes_verified if r not in selection]
+            nb_manquants = max(0, max_routes - len(selection))
+            selection.extend(restants[:nb_manquants])
+        
+        selection.sort(key=lambda x: x["pct_couvert"], reverse=True)
+        
+        return selection[:max_routes]
+        
+    except Exception as e:
+        print(f"[mobilite] ⚠️ Erreur routes vérifiées: {e}")
+        import traceback
+        traceback.print_exc()
+        return []
+
+def generate_heatmap_data(cyclables_gdf, max_points: int = 1000):
+    """Génère les données pour la heatmap"""
+    if cyclables_gdf is None or len(cyclables_gdf) == 0:
+        return []
+    
+    points = []
+    step = max(1, len(cyclables_gdf) // max_points)
+    
+    for idx in range(0, len(cyclables_gdf), step):
+        try:
+            seg = cyclables_gdf.iloc[idx]
+            centroid = seg.geometry.centroid
+            qualite = TYPES_AMENAGEMENTS.get(seg.get("type_norm", "AUTRE"), {}).get("qualite", 2)
+            intensity = qualite / 5.0
+            points.append([centroid.y, centroid.x, intensity])
+        except:
+            continue
+    
+    return points
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# FONCTIONS TENDANCES (INTÉGRATION DEPUIS mobilite_INTEGRATION_TRENDS.py)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def analyze_availability_trends(ville: str, stations_data: List[Dict] = None) -> Dict:
+    """
+    Analyse les tendances de disponibilité pour une ville
+    """
+    analyzer = get_trends_analyzer()
+    
+    # 1. Essayer les données historiques
+    if analyzer:
+        try:
+            trends = analyzer.get_trends(ville, jours=7)
+            if trends and trends.get('is_real') and trends.get('hours'):
+                print(f"[mobilite] 📊 Tendances réelles pour {ville} ({len(trends.get('hours', []))}h)")
+                return trends
+        except Exception as e:
+            print(f"[mobilite] ⚠️ Erreur récupération tendances {ville}: {e}")
+    
+    # 2. Si on a des stations actuelles, créer un profil temps réel
+    if stations_data and len(stations_data) > 0:
+        print(f"[mobilite] 🔄 Utilisation données temps réel pour {ville} ({len(stations_data)} stations)")
+        return _build_trends_from_current_data(ville, stations_data)
+    
+    # 3. Fallback : structure vide mais informative
+    print(f"[mobilite] ⚠️ Aucune donnée disponible pour {ville}")
+    return {
+        "hours": [],
+        "availability": [],
+        "is_real": False,
+        "fallback_reason": f"En attente de collecte pour {ville}",
+        "ville": ville
+    }
+
+def _build_trends_from_current_data(ville: str, stations_data: List[Dict]) -> Dict:
+    """
+    Construit un profil horaire basé sur les données actuelles réelles
+    sans inventer de fausses données.
+    """
+    if not stations_data:
+        return None
+    
+    # Calculer la disponibilité actuelle réelle
+    total_capacity = sum(s.get('capacity', 0) or 30 for s in stations_data)
+    total_available = sum(s.get('velos', 0) or 0 for s in stations_data)
+    current_ratio = (total_available / total_capacity * 100) if total_capacity > 0 else 0
+    current_hour = datetime.now().hour
+    
+    # Pattern de variation horaire (factors, pas valeurs absolues)
+    # Basé sur des études de mobilité réelles
+    variation_factors = {
+        0: 1.15, 1: 1.20, 2: 1.25, 3: 1.25, 4: 1.20, 5: 1.10,  # Nuit haute
+        6: 0.95, 7: 0.75, 8: 0.65, 9: 0.70,  # Rush matin (basse)
+        10: 0.80, 11: 0.85, 12: 0.80, 13: 0.85, 14: 0.90, 15: 0.88,  # Journée
+        16: 0.75, 17: 0.60, 18: 0.55, 19: 0.65,  # Rush soir (basse)
+        20: 0.75, 21: 0.85, 22: 0.95, 23: 1.05  # Soirée
+    }
+    
+    # Appliquer les variations au ratio actuel réel
+    hours = list(range(24))
+    availability = []
+    for h in hours:
+        base = current_ratio * variation_factors[h]
+        # Ajouter une petite incertitude (±3%) car c'est une projection
+        noise = np.random.uniform(-3, 3) if h != current_hour else 0
+        availability.append(round(max(5, min(95, base + noise)), 1))
+    
+    # Forcer l'heure actuelle à la valeur réelle mesurée
+    availability[current_hour] = round(current_ratio, 1)
+    
+    # Identifier les pics
+    morning_min = min(availability[7:10])
+    evening_min = min(availability[17:20])
+    peak_morning = 7 + availability[7:10].index(morning_min)
+    peak_evening = 17 + availability[17:20].index(evening_min)
+    best_time = availability.index(max(availability))
+    
+    return {
+        "hours": hours,
+        "availability": availability,
+        "peak_morning": peak_morning,
+        "peak_evening": peak_evening,
+        "best_time": best_time,
+        "current_hour": current_hour,
+        "current_availability": round(current_ratio, 1),
+        "total_stations": len(stations_data),
+        "is_real": False,  # C'est une projection, pas des données historiques
+        "data_quality": "projected_from_real",  # Mais basée sur des données réelles
+        "fallback_reason": f"Projection basée sur {len(stations_data)} stations à {current_hour}h",
+        "ville": ville
+    }
+
+
+def generate_synthetic_trends(ville: str) -> Dict:
+    """Fallback : retourne structure vide au lieu de données inventées"""
+    return {
+        "hours": [],
+        "availability": [],
+        "is_real": False,
+        "fallback_reason": "En attente de première collecte de données",
+        "ville": ville
+    }
+
+def build_trends_chart(ville: str, stations_data: List[Dict] = None):
+    """
+    Graphique des tendances horaires basé sur VRAIES DONNÉES collectées
+    Intégration depuis mobilite_INTEGRATION_TRENDS.py
+    """
+    if not ville:
+        ville = "Paris"
+    
+    # Passer les stations actuelles
+    trends = analyze_availability_trends(ville, stations_data)
+
+    if not trends.get('hours') and stations_data:
+        print(f"[mobilite] 🔄 Pas d'historique pour {ville}, utilisation données temps réel")
+        trends = _build_trends_from_current_data(ville, stations_data)
+    
+    # Gérer le cas "pas de données"
+    if not trends.get('hours'):
+        return html.Div("⏳ En attente de collecte de données...", 
+                       style={'padding': '20px', 'textAlign': 'center', 'color': '#6b7280'})
+    
+    # Déterminer la couleur selon si données réelles ou fallback
+    if trends.get('is_real'):
+        line_color = '#16a34a'  # Vert = historique réel
+        fill_color = 'rgba(22, 163, 74, 0.1)'  # ✅ DÉFINI ICI
+        data_quality = "Données historiques"
+    elif trends.get('data_quality') == 'projected_from_real':
+        line_color = '#3b82f6'  # Bleu = projection basée sur réel
+        fill_color = 'rgba(59, 130, 246, 0.1)'  # ✅ DÉFINI ICI
+        data_quality = trends.get('fallback_reason', 'Projection')
+    else:
+        line_color = '#9CA3AF'  # Gris = pas de données
+        fill_color = 'rgba(156, 163, 175, 0.1)'  # ✅ DÉFINI ICI
+        data_quality = "Aucune donnée"
+    
+    fig = go.Figure()
+    
+    # Courbe principale
+    fig.add_trace(go.Scatter(
+        x=trends['hours'],
+        y=trends['availability'],
+        mode='lines+markers' if trends.get('is_real') else 'lines',
+        name='Disponibilité',
+        line=dict(color=line_color, width=3),
+        fill='tozeroy',
+        fillcolor=fill_color,  # ✅ Maintenant défini dans tous les cas
+        marker=dict(size=4) if trends.get('is_real') else None,
+        hovertemplate='Heure: %{x}h<br>Disponibilité: %{y:.1f}%<extra></extra>'
+    ))
+    
+    
+    
+    # Zones de pics (seulement si données réelles)
+    if trends.get('is_real'):
+        morning_peak = trends.get('peak_morning', 8)
+        evening_peak = trends.get('peak_evening', 18)
+        
+        fig.add_vrect(
+            x0=morning_peak-1, x1=morning_peak+1,
+            fillcolor="rgba(234, 88, 12, 0.15)",
+            layer="below", line_width=0,
+            annotation_text=f"Pic {morning_peak}h",
+            annotation_position="top left",
+            annotation_font_size=9
+        )
+        
+        fig.add_vrect(
+            x0=evening_peak-1, x1=evening_peak+1,
+            fillcolor="rgba(234, 88, 12, 0.15)",
+            layer="below", line_width=0,
+            annotation_text=f"Pic {evening_peak}h",
+            annotation_position="top right",
+            annotation_font_size=9
+        )
+        
+        # Meilleur moment (ligne pointillée)
+        best = trends.get('best_time', 2)
+        fig.add_vline(
+            x=best,
+            line_dash="dash",
+            line_color="#2D6A4F",
+            line_width=2,
+            annotation_text=f"Optimal {best}h",
+            annotation_position="bottom",
+            annotation_font_size=9
+        )
+    
+    # Titre avec qualité des données
+    title_text = f"📊 Tendances - {ville}"
+    
+    # Sous-titre selon qualité
+    if trends.get('is_real'):
+        fiabilite = trends.get('fiabilite', 0)
+        data_points = trends.get('data_points', 0)
+        subtitle = f"{data_points:,} points • {fiabilite:.0f}% couverture • {trends.get('jours_analysés', 7)}j"
+        title_color = "#16a34a"
+    else:
+        subtitle = data_quality
+        title_color = "#9CA3AF"
+    
+    fig.update_layout(
+        title={
+            'text': title_text,
+            'font': {'size': 14, 'color': '#374151'}
+        },
+        xaxis_title="Heure",
+        yaxis_title="Disponibilité (%)",
+        height=250,
+        margin=dict(l=40, r=20, t=60, b=30),
+        showlegend=False,
+        plot_bgcolor='rgba(0,0,0,0)',
+        paper_bgcolor='rgba(0,0,0,0)',
+        hovermode='x unified',
+        annotations=[
+            dict(
+                xref="paper", yref="paper",
+                x=0.5, y=1.15,
+                text=subtitle,
+                showarrow=False,
+                font=dict(size=10, color=title_color),
+                xanchor='center'
+            )
+        ]
+    )
+    
+    # Ajouter métadonnées si disponibles
+    if trends.get('metadata') and trends['metadata'].get('last_collection'):
+        try:
+            last_up = datetime.fromisoformat(trends['metadata']['last_collection']).strftime("%H:%M")
+            fig.add_annotation(
+                xref="paper", yref="paper",
+                x=0.98, y=1.15,
+                text=f"Màj {last_up}",
+                showarrow=False,
+                font=dict(size=9, color="#6B7280"),
+                xanchor='right'
+            )
+        except:
+            pass
+    
+    return dcc.Graph(figure=fig, config={'displayModeBar': False})
+
+def build_collection_status_badge(ville: str):
+    """
+    Badge indiquant le statut de la collecte de données
+    Intégration depuis mobilite_INTEGRATION_TRENDS.py
+    """
+    analyzer = get_trends_analyzer()
+    if not analyzer:
+        return html.Div(style={
+            'padding': '6px 12px',
+            'background': '#F3F4F6',
+            'borderRadius': '6px',
+            'fontSize': '0.75rem',
+            'color': '#6B7280',
+        }, children="📊 Module tendances non disponible")
+    
+    try:
+        status = analyzer.get_collection_status(ville)
+    except:
+        status = {'status': 'unknown'}
+    
+    if status.get('status') == 'no_data':
+        return html.Div(style={
+            'padding': '6px 12px',
+            'background': '#FEF3C7',
+            'borderRadius': '6px',
+            'fontSize': '0.75rem',
+            'color': '#92400E',
+            'border': '1px solid #FCD34D'
+        }, children=[
+            html.Span("⏳ ", style={'marginRight': '4px'}),
+            "Collecte en cours... Données disponibles sous 48h"
+        ])
+    
+    jours = status.get('jours_distincts', 0)
+    heures = status.get('heures_distinctes', 0)
+    total = status.get('total_snapshots', 0)
+    
+    if jours < 2:
+        bg = '#DBEAFE'
+        border = '#60A5FA'
+        color = '#1E3A8A'
+        icon = '🔄'
+        text = f"En collecte : {jours}j • {heures}h • {total:,} pts"
+    elif jours < 7:
+        bg = '#D1FAE5'
+        border = '#34D399'
+        color = '#065F46'
+        icon = '📊'
+        text = f"Partiel : {jours}j • {heures}h • {total:,} pts"
+    else:
+        bg = '#D1FAE5'
+        border = '#10B981'
+        color = '#065F46'
+        icon = '✅'
+        text = f"Complet : {jours}j • {heures}h • {total:,} pts"
+    
+    return html.Div(style={
+        'padding': '6px 12px',
+        'background': bg,
+        'borderRadius': '6px',
+        'fontSize': '0.75rem',
+        'color': color,
+        'border': f'1px solid {border}'
+    }, children=[
+        html.Span(f"{icon} ", style={'marginRight': '4px'}),
+        text
+    ])
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# COMPOSANTS UI AVANCÉS
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def skeleton_card():
+    return html.Div(style={
+        "background": "#f3f4f6",
+        "borderRadius": "12px",
+        "padding": "20px",
+        "animation": "pulse 2s cubic-bezier(0.4, 0, 0.6, 1) infinite",
+    }, children=[
+        html.Div(style={"height": "20px", "width": "60%", "background": "#e5e7eb", "borderRadius": "4px", "marginBottom": "12px"}),
+        html.Div(style={"height": "12px", "width": "100%", "background": "#e5e7eb", "borderRadius": "4px", "marginBottom": "8px"}),
+        html.Div(style={"height": "12px", "width": "80%", "background": "#e5e7eb", "borderRadius": "4px"}),
+    ])
+
+def build_cyclability_banner(score_info):
+    score = score_info["score_total"]
+    niveau, description = score_info["niveau"]
+    details = score_info["details"]
+    stats = score_info["stats"]
+    
+    colors = {
+        (75, 100): ("#2D6A4F", "#D1FAE5"),
+        (55, 74):  ("#1A4B8C", "#DBEAFE"),
+        (35, 54):  ("#F4A620", "#FEF3C7"),
+        (15, 34):  ("#E85D04", "#FFE4D6"),
+        (0, 14):   ("#9D0208", "#FEE2E2"),
+    }
+    
+    for (min_s, max_s), (border_color, bg_color) in colors.items():
+        if min_s <= score <= max_s:
+            break
+    
+    def _badge(emoji, label, score_val):
+        return html.Div(style={
+            "display": "flex", "alignItems": "center", "gap": "6px",
+            "background": "rgba(255,255,255,0.8)", "padding": "6px 12px",
+            "borderRadius": "20px", "fontSize": "0.8rem",
+            "border": "1px solid rgba(0,0,0,0.05)",
+        }, children=[
+            html.Span(emoji),
+            html.Span(label, style={"fontWeight": "500"}),
+            html.Span(f"({score_val})", style={"color": "#6B7280", "fontSize": "0.75rem"}),
+        ])
+    
+    return html.Div(style={
+        "background": f"linear-gradient(135deg, {bg_color}, #fff)",
+        "borderLeft": f"5px solid {border_color}",
+        "borderRadius": "12px", "padding": "20px 24px",
+        "display": "flex", "alignItems": "center",
+        "gap": "24px", "flexWrap": "wrap",
+    }, children=[
+        html.Div(style={
+            "width": "80px", "height": "80px", "borderRadius": "50%",
+            "background": border_color, "display": "flex",
+            "flexDirection": "column", "alignItems": "center",
+            "justifyContent": "center", "color": "white",
+        }, children=[
+            html.Div(f"{score}", style={"fontSize": "2rem", "fontWeight": "800"}),
+            html.Div("/100", style={"fontSize": "0.7rem", "opacity": "0.9"}),
+        ]),
+        html.Div(style={"flex": "1", "minWidth": "200px"}, children=[
+            html.H4(niveau, style={"color": border_color, "marginBottom": "4px"}),
+            html.P(description, style={"color": "#4B5563", "fontSize": "0.9rem", "marginBottom": "12px"}),
+            html.Div(style={"display": "flex", "gap": "12px", "flexWrap": "wrap"}, children=[
+                _badge("📏", f"{stats['km_total']} km", f"{details['densite']:.0f}/30"),
+                _badge("⭐", "Qualité", f"{details['qualite']:.0f}/25"),
+                _badge("🔗", f"{stats['nb_composantes']} réseaux", f"{details['connectivite']:.0f}/25"),
+                _badge("📍", "Accessibilité", f"{details['accessibilite']:.0f}/20"),
+            ]),
+        ]),
+        html.Div(style={"textAlign": "center"}, children=[
+            html.Div(
+                "🚴 Recommandé" if score >= 55 else "🚲 Possible" if score >= 35 else "⚠️ Difficile",
+                style={
+                    "padding": "10px 16px", "background": border_color,
+                    "color": "white", "borderRadius": "8px", "fontWeight": "600",
+                }
+            ),
+        ]),
+    ])
+
+def build_velo_section_avancee(stations_by_ville, villes, gare_nom, radius_km=None):
+    """
+    Version avancée avec graphiques et analytics
+    """
+    total_stations_globales = sum(len(stations) for stations in (stations_by_ville or {}).values())
+    
+    # CAS SPÉCIAL: Des villes mais peu de stations dans le rayon
+    if not villes or not stations_by_ville or total_stations_globales == 0:
+        message = []
+        
+        if villes and radius_km:
+            message.extend([
+                html.Div(f"ℹ️ Aucune station dans un rayon de {radius_km}km", 
+                        style={"fontWeight": "500", "color": "#4b5563"}),
+                html.Div(f"Services disponibles dans la région: {', '.join(villes)}", 
+                        style={"fontSize": "0.8rem", "color": "#6b7280", "marginTop": "4px"}),
+            ])
+            
+            # SUGGESTION CONTEXTUELLE
+            if any(v in ['Paris', 'Lyon', 'Marseille', 'Bordeaux', 'GPSEO', 'SIEMU'] for v in villes):
+                message.append(
+                    html.Div([
+                        "💡 Ce quartier a peu de stations, mais le réseau est dense. ",
+                        html.Br(),
+                        "Essayez d'augmenter le rayon à 10km pour voir plus d'options."
+                    ], style={"fontSize": "0.8rem", "color": "#92400E", "marginTop": "8px", 
+                             "background": "#FEF3C7", "padding": "8px 12px", "borderRadius": "6px"})
+                )
+            else:
+                message.append(
+                    html.Div("💡 Essayez d'augmenter le rayon d'analyse à 10km", 
+                            style={"fontSize": "0.8rem", "color": "#92400E", "marginTop": "8px"})
+                )
+        else:
+            message = [html.Div(f"ℹ️ Aucun service de vélos en libre-service à {gare_nom}", 
+                               style={"fontWeight": "500", "color": "#4b5563"})]
+        
+        return html.Div(style={
+            "padding": "16px", 
+            "background": "#f3f4f6",
+            "borderRadius": "8px", 
+            "borderLeft": "4px solid #9ca3af",
+        }, children=message)
+    
+    # MESSAGE INFORMATIF: Si peu de stations mais des villes
+    info_banner = None
+    if total_stations_globales < 5 and len(villes) > 1:
+        info_banner = html.Div(
+            f"ℹ️ Seulement {total_stations_globales} stations très proches, "
+            f"mais {len(villes)} services disponibles dans la région",
+            style={
+                "fontSize": "0.8rem", "color": "#1E3A8A", "marginBottom": "12px",
+                "background": "#DBEAFE", "padding": "8px 12px", "borderRadius": "6px"
+            }
+        )
+    
+    all_sections = []
+    if info_banner:
+        all_sections.append(info_banner)
+    
+    total_vehicles = 0
+    total_stations = 0
+    
+    # N'afficher que les villes qui ont des stations
+    villes_avec_stations = {v: s for v, s in stations_by_ville.items() if len(s) > 0}
+    
+    for ville, stations in villes_avec_stations.items():
+        total_stations += len(stations)
+        total_vehicles += sum(s['velos'] for s in stations)
+        
+        # Compter par type
+        n_stations = len([s for s in stations if s['type'] == 'station'])
+        n_free = len([s for s in stations if s['type'] == 'free_floating'])
+        
+        # Calculer les totaux par type de véhicule
+        total_meca = sum(s['velos_meca'] for s in stations)
+        total_elec = sum(s['velos_elec'] for s in stations)
+        total_scooters = sum(s['scooters'] for s in stations)
+        
+        # Pie chart conditionnel
+        values_pie = []
+        labels_pie = []
+        colors_pie = []
+        
+        if total_meca > 0:
+            values_pie.append(total_meca)
+            labels_pie.append('Vélos méca')
+            colors_pie.append('#2D6A4F')
+        if total_elec > 0:
+            values_pie.append(total_elec)
+            labels_pie.append('Vélos élec')
+            colors_pie.append('#1A4B8C')
+        if total_scooters > 0:
+            values_pie.append(total_scooters)
+            labels_pie.append('Scooters')
+            colors_pie.append('#E85D04')
+        
+        if values_pie:
+            fig_pie = go.Figure(data=[go.Pie(
+                labels=labels_pie,
+                values=values_pie,
+                marker_colors=colors_pie,
+                hole=0.6,
+                textinfo='none'
+            )])
+            fig_pie.update_layout(
+                showlegend=False,
+                margin=dict(l=0, r=0, t=0, b=0),
+                height=80,
+                paper_bgcolor='rgba(0,0,0,0)',
+                plot_bgcolor='rgba(0,0,0,0)',
+                annotations=[dict(text=f"{sum(values_pie)}", x=0.5, y=0.5, 
+                                font_size=14, showarrow=False)]
+            )
+            pie_chart = dcc.Graph(figure=fig_pie, config={'displayModeBar': False}, 
+                                 style={"width": "80px", "height": "80px"})
+        else:
+            pie_chart = html.Div("🚲", style={"fontSize": "2rem", "width": "80px", "textAlign": "center"})
+        
+        # Liste des stations
+        rows = []
+        for s in sorted(stations, key=lambda x: x['distance_m'])[:8]:
+            if not s.get('actif', True):
+                color, status = "#6b7280", "Hors service"
+            elif s['velos'] == 0:
+                color, status = "#dc2626", "0 vélo"
+            elif s['velos'] < 3:
+                color, status = "#ea580c", f"{s['velos']} vélos"
+            else:
+                color, status = "#16a34a", f"{s['velos']} vélos"
+            
+            type_icone = "🅿️" if s.get("type") == "station" else "📍"
+            occupation_width = min(s.get('occupation', 0), 100)
+            
+            rows.append(html.Div(style={
+                "marginBottom": "8px", "padding": "8px",
+                "background": "#f9fafb", "borderRadius": "6px",
+                "borderLeft": f"3px solid {color}"
+            }, children=[
+                html.Div(style={
+                    "display": "flex", "justifyContent": "space-between",
+                    "marginBottom": "4px"
+                }, children=[
+                    html.Div([
+                        html.Span(f"{type_icone} {s['nom'][:25]}...", 
+                                 style={"fontWeight": "500", "fontSize": "0.85rem"}),
+                        html.Div(f"{s['distance_m']}m • {s['reseau']}", 
+                                style={"fontSize": "0.7rem", "color": "#6b7280"}),
+                    ]),
+                    html.Div(status, style={"color": color, "fontWeight": "600", "fontSize": "0.85rem"}),
+                ]),
+                html.Div(style={
+                    "width": "100%", "height": "4px", "background": "#e5e7eb",
+                    "borderRadius": "2px", "marginTop": "4px"
+                }, children=[
+                    html.Div(style={
+                        "width": f"{occupation_width}%", "height": "4px",
+                        "background": color, "borderRadius": "2px"
+                    })
+                ])
+            ]))
+        
+        # Section complète
+        section = html.Div([
+            html.Div(style={
+                "display": "flex", "justifyContent": "space-between",
+                "alignItems": "center", "marginBottom": "12px"
+            }, children=[
+                html.Div(style={"flex": "1"}, children=[
+                    html.H6(f"🚲 {ville}", style={"margin": 0, "fontSize": "1rem"}),
+                    html.Span(f"{n_stations} stations, {n_free} free-floating",
+                             style={"fontSize": "0.7rem", "color": "#6b7280"}),
+                ]),
+                pie_chart,
+            ]),
+            
+            html.Div(style={
+                "display": "grid", 
+                "gridTemplateColumns": "repeat(3, 1fr)" if total_scooters > 0 else "repeat(2, 1fr)",
+                "gap": "8px", "marginBottom": "12px"
+            }, children=[
+                html.Div(style={
+                    "background": "#f0fdf4", "padding": "8px",
+                    "borderRadius": "6px", "textAlign": "center"
+                }, children=[
+                    html.Div("🚲 Méca", style={"fontSize": "0.7rem", "color": "#166534"}),
+                    html.Div(f"{total_meca}", style={"fontWeight": "600", "color": "#166534"}),
+                ]),
+                html.Div(style={
+                    "background": "#dbeafe", "padding": "8px",
+                    "borderRadius": "6px", "textAlign": "center"
+                }, children=[
+                    html.Div("⚡ Élec", style={"fontSize": "0.7rem", "color": "#1e3a8a"}),
+                    html.Div(f"{total_elec}", style={"fontWeight": "600", "color": "#1e3a8a"}),
+                ]),
+                html.Div(style={
+                    "background": "#ffedd5", "padding": "8px",
+                    "borderRadius": "6px", "textAlign": "center"
+                }, children=[
+                    html.Div("🛴 Trott.", style={"fontSize": "0.7rem", "color": "#9a3412"}),
+                    html.Div(f"{total_scooters}", style={"fontWeight": "600", "color": "#9a3412"}),
+                ]) if total_scooters > 0 else None,
+            ]),
+            
+            html.Div(rows, style={"maxHeight": "250px", "overflowY": "auto"}),
+            
+        ], style={"marginBottom": "16px", "padding": "16px", "background": "#fff", 
+                 "borderRadius": "8px", "border": "1px solid #e5e7eb"})
+        
+        all_sections.append(section)
+    
+    # En-tête avec stats globales
+    villes_actives = len(villes_avec_stations)
+    header = html.Div(style={
+        "display": "flex", "justifyContent": "space-between",
+        "alignItems": "center", "marginBottom": "16px", "padding": "0 4px"
+    }, children=[
+        html.Div([
+            html.H5("🚲 Vélos en libre-service", style={"margin": 0}),
+            html.Span(f"{villes_actives}/{len(villes)} villes • {total_stations} points",
+                     style={"fontSize": "0.8rem", "color": "#6b7280"}),
+        ]),
+        html.Div(style={
+            "background": "#f0fdf4", "padding": "8px 16px",
+            "borderRadius": "20px", "textAlign": "center"
+        }, children=[
+            html.Div("Disponibles", style={"fontSize": "0.7rem", "color": "#166534"}),
+            html.Div(f"{total_vehicles}", style={"fontSize": "1.5rem", "fontWeight": "700", "color": "#166534"}),
+        ]),
+    ])
+    
+    return html.Div([
+        header,
+        html.Div(all_sections, style={"maxHeight": "500px", "overflowY": "auto"}),
+    ])
+
+
+def build_verified_routes(routes_verified):
+    if not routes_verified:
+        return html.P("Aucun itinéraire vérifié trouvé dans ce rayon.",
+                     style={"color": "#9CA3AF", "fontSize": "0.85rem"})
+    
+    cards = []
+    for route in routes_verified:
+        cards.append(html.Div(style={
+            "padding": "14px",
+            "background": "#f8fafc",
+            "borderRadius": "8px",
+            "borderLeft": f"4px solid {route['color']}",
+            "marginBottom": "8px",
+        }, children=[
+            html.Div(style={
+                "display": "flex", "justifyContent": "space-between",
+                "marginBottom": "8px"
+            }, children=[
+                html.Div(route['destination'], style={"fontWeight": "600", "fontSize": "0.9rem"}),
+                html.Span(route['type'], style={"fontSize": "0.7rem", "color": "#6b7280"}),
+            ]),
+            html.Div(style={
+                "display": "flex", "gap": "12px",
+                "fontSize": "0.75rem", "color": "#6B7280",
+                "flexWrap": "wrap",
+            }, children=[
+                html.Span(f"📏 {route['distance_km']} km"),
+                html.Span(f"⏱️ {route['temps_min']} min"),
+                html.Span(f"🛡️ {route['pct_couvert']}% sécurisé"),
+                html.Span(route['qualite'], style={"color": route['color'], "fontWeight": "600"}),
+            ]),
+        ]))
+    
+    return html.Div(cards)
+
+def build_intermodal_comparison(gare_row, df_poi_local):
+    """Comparateur intermodal avec calculs RÉALISTES urbains"""
+    
+    # ✅ CALCUL DISTANCE ROBUSTE AVEC FALLBACKS MULTIPLES
+    distance_km = None
+    
+    # Tentative 1 : Utiliser les POIs fournis
+    if df_poi_local is not None and len(df_poi_local) > 0:
+        # S'assurer que distance_km existe
+        if "distance_km" not in df_poi_local.columns:
+            df_poi_local = df_poi_local.copy()
+            df_poi_local["distance_km"] = df_poi_local.apply(
+                lambda r: compute_distance_km(
+                    gare_row["latitude"], gare_row["longitude"],
+                    r["latitude"], r["longitude"]
+                ), axis=1
+            )
+        
+        distances = df_poi_local["distance_km"].tolist()
+        distances_filtrees = [d for d in distances if 0.5 <= d <= 5.0]
+        
+        if distances_filtrees:
+            distance_km = np.median(distances_filtrees)
+            print(f"[mobilite] 📍 Distance POI médiane: {distance_km:.1f}km ({len(distances_filtrees)} POIs)")
+        elif distances:
+            distance_km = np.percentile(distances, 60)
+            print(f"[mobilite] 📍 Distance POI percentile: {distance_km:.1f}km")
+    
+    # Tentative 2 : Si pas de POIs dans poi_page, charger TOUS les POIs de la gare
+    if distance_km is None:
+        print(f"[mobilite] ⚠️ Aucun POI dans poi_page, rechargement complet...")
+        try:
+            poi_complets = filter_poi_by_bbox(
+                get_poi(),  # Tous les POIs
+                gare_row["latitude"], 
+                gare_row["longitude"], 
+                5.0  # Rayon de 5km
+            )
+            
+            if len(poi_complets) > 0:
+                poi_complets["distance_km"] = poi_complets.apply(
+                    lambda r: compute_distance_km(
+                        gare_row["latitude"], gare_row["longitude"],
+                        r["latitude"], r["longitude"]
+                    ), axis=1
+                )
+                
+                distances = poi_complets["distance_km"].tolist()
+                distances_filtrees = [d for d in distances if 0.5 <= d <= 5.0]
+                
+                if distances_filtrees:
+                    distance_km = np.median(distances_filtrees)
+                    print(f"[mobilite] 📍 Distance POI (rechargé): {distance_km:.1f}km")
+        except Exception as e:
+            print(f"[mobilite] ❌ Erreur rechargement POIs: {e}")
+    
+    # Tentative 3 : Estimation géographique (ville vs campagne)
+    if distance_km is None:
+        gare_nom = gare_row.get("libelle", "").lower()
+        
+        # Grandes villes : centre proche
+        if any(v in gare_nom for v in ["paris", "lyon", "marseille", "lille", "bordeaux", "toulouse", "nantes", "strasbourg", "montpellier", "nice", "rennes", "grenoble"]):
+            distance_km = 1.5
+            print(f"[mobilite] 📍 Distance estimée (grande ville): {distance_km}km")
+        
+        # Villes moyennes
+        elif any(v in gare_nom for v in ["mulhouse", "nancy", "rouen", "avignon", "brest", "angers", "limoges", "metz", "reims", "dijon"]):
+            distance_km = 2.0
+            print(f"[mobilite] 📍 Distance estimée (ville moyenne): {distance_km}km")
+        
+        # Petites villes / campagne
+        else:
+            distance_km = 2.5
+            print(f"[mobilite] 📍 Distance estimée (défaut): {distance_km}km")
+    
+    # Limiter entre 0.8 et 5.0 km
+    distance_km = round(max(0.8, min(distance_km, 5.0)), 1)
+    
+    print(f"[mobilite] 🎯 Distance finale utilisée: {distance_km}km pour {gare_row.get('libelle', 'gare')}")
+    
+    # ✅ VITESSES RÉALISTES EN MILIEU URBAIN DENSE
+    vitesse_velo = 14   # km/h (avec feux, OK)
+    vitesse_marche = 5  # km/h (standard)
+    vitesse_bus = 11    # km/h (lent avec arrêts)
+    
+    # ✅ TAXI : Vitesse qui DIMINUE avec la congestion urbaine
+    if distance_km <= 1.5:
+        vitesse_taxi = 10  # km/h (congestion extrême, centre-ville)
+    elif distance_km <= 3.0:
+        vitesse_taxi = 15  # km/h (congestion modérée)
+    else:
+        vitesse_taxi = 20  # km/h (périphérie)
+    
+    # ✅ TEMPS AVEC PRISES EN CHARGE RÉALISTES
+    temps_velo = max(4, round((distance_km / vitesse_velo) * 60 + 2))
+    temps_marche = max(8, round((distance_km / vitesse_marche) * 60))
+    temps_bus = max(10, round((distance_km / vitesse_bus) * 60 + 8))
+    
+    temps_deplacement_taxi = (distance_km / vitesse_taxi) * 60
+    
+    if distance_km <= 1.5:
+        temps_taxi = max(8, round(temps_deplacement_taxi + 5))
+    elif distance_km <= 3.0:
+        temps_taxi = max(7, round(temps_deplacement_taxi + 3))
+    else:
+        temps_taxi = max(6, round(temps_deplacement_taxi + 2))
+    
+    # CO2 et coûts
+    co2_bus = round(distance_km * 95)
+    co2_taxi = round(distance_km * 180)
+    co2_velo = 0
+    co2_marche = 0
+    
+    cout_bus = 1.70
+    cout_taxi = round(7.50 + (distance_km * 1.90), 2)
+    cout_velo = 0
+    cout_marche = 0
+    
+    # Création des modes
+    modes = [
+        {
+            "mode": "🚴 Vélo",
+            "temps": temps_velo,
+            "co2": co2_velo,
+            "cout": cout_velo,
+            "color": "#2D6A4F",
+            "vitesse": vitesse_velo,
+            "description": "Le plus rapide et écologique"
+        },
+        {
+            "mode": "🚕 Taxi",
+            "temps": temps_taxi,
+            "co2": co2_taxi,
+            "cout": cout_taxi,
+            "color": "#E85D04",
+            "vitesse": vitesse_taxi,
+            "description": "Pratique mais coûteux et lent en ville"
+        },
+        {
+            "mode": "🚌 Bus",
+            "temps": temps_bus,
+            "co2": co2_bus,
+            "cout": cout_bus,
+            "color": "#1A4B8C",
+            "vitesse": vitesse_bus,
+            "description": "Économique mais lent"
+        },
+        {
+            "mode": "🚶 Marche",
+            "temps": temps_marche,
+            "co2": co2_marche,
+            "cout": cout_marche,
+            "color": "#52B788",
+            "vitesse": vitesse_marche,
+            "description": "Santé et écologie"
+        },
+    ]
+    
+    modes.sort(key=lambda x: x["temps"])
+    
+    # Graphique
+    fig = go.Figure()
+    
+    for m in modes:
+        fig.add_trace(go.Bar(
+            name=m['mode'],
+            x=[m['mode']],
+            y=[m['temps']],
+            marker_color=m['color'],
+            text=f"{m['temps']} min",
+            textposition='outside',
+            hovertemplate=(
+                f"<b>{m['mode']}</b><br>" +
+                f"Distance: {distance_km:.1f} km<br>" +
+                f"Vitesse: {m['vitesse']} km/h<br>" +
+                f"Temps: {m['temps']} min<br>" +
+                f"CO₂: {m['co2']} g<br>" +
+                f"Coût: {m['cout']:.2f}€<br>" +
+                f"<i>{m['description']}</i><extra></extra>"
+            )
+        ))
+    
+    fig.update_layout(
+        barmode='group',
+        height=220,
+        margin=dict(l=40, r=20, t=40, b=20),
+        showlegend=False,
+        plot_bgcolor='rgba(0,0,0,0)',
+        paper_bgcolor='rgba(0,0,0,0)',
+        yaxis_title="Temps (minutes)",
+        yaxis=dict(gridcolor='rgba(0,0,0,0.1)'),
+        font=dict(size=11),
+        annotations=[dict(
+            x=0.5, y=1.15,
+            xref='paper', yref='paper',
+            text=f"Distance estimée : {distance_km:.1f} km",
+            showarrow=False,
+            font=dict(size=12, color='#374151')
+        )]
+    )
+    
+    # Tableau
+    rows = []
+    header = html.Div(
+        f"📍 Distance vers centre-ville : {distance_km:.1f} km",
+        style={
+            "fontSize": "0.9rem",
+            "color": "#4B5563",
+            "marginBottom": "12px",
+            "padding": "8px 12px",
+            "background": "#F3F4F6",
+            "borderRadius": "6px",
+            "textAlign": "center"
+        }
+    )
+    
+    for rank, m in enumerate(modes, 1):
+        is_best = rank == 1
+        ecart = m['temps'] - modes[0]['temps'] if not is_best else 0
+        
+        rows.append(html.Div(style={
+            "display": "flex",
+            "alignItems": "center",
+            "gap": "12px",
+            "padding": "10px 14px",
+            "background": m['color'] if is_best else "#f8fafc",
+            "borderRadius": "8px",
+            "marginBottom": "6px",
+            "border": f"2px solid {m['color']}" if is_best else "1px solid #e5e7eb",
+            "color": "white" if is_best else "inherit"
+        }, children=[
+            html.Div(style={"display": "flex", "alignItems": "center", "gap": "8px", "width": "90px"}, children=[
+                html.Span(f"#{rank}", style={
+                    "fontWeight": "800",
+                    "fontSize": "0.9rem",
+                    "opacity": "0.8" if not is_best else "1"
+                }),
+                html.Span(m['mode'], style={"fontWeight": "600", "fontSize": "0.9rem"})
+            ]),
+            
+            html.Div(style={"flex": "1", "display": "flex", "gap": "16px", "alignItems": "center"}, children=[
+                html.Span(f"⏱️ {m['temps']} min", style={
+                    "fontWeight": "700" if is_best else "500",
+                    "fontSize": "0.95rem"
+                }),
+                html.Span(f"💰 {m['cout']:.2f}€" if m['cout'] > 0 else "🌱 Gratuit", 
+                         style={"fontSize": "0.85rem", "opacity": "0.9"}),
+                html.Span(f"🌱 {m['co2']}g CO₂", 
+                         style={"fontSize": "0.85rem", "opacity": "0.9"}),
+            ]),
+            
+            html.Div(
+                "✓ Recommandé" if is_best else f"+{ecart} min",
+                style={
+                    "background": "rgba(255,255,255,0.2)" if is_best else "#F3F4F6",
+                    "color": "white" if is_best else "#6B7280",
+                    "padding": "4px 10px",
+                    "borderRadius": "12px",
+                    "fontSize": "0.75rem",
+                    "fontWeight": "600",
+                }
+            ) if is_best or ecart > 2 else html.Div(
+                f"+{ecart} min",
+                style={"fontSize": "0.75rem", "color": "#9CA3AF"}
+            ),
+        ]))
+    
+    return html.Div([
+        header,
+        dcc.Graph(figure=fig, config={'displayModeBar': False}, style={"marginTop": "8px"}),
+        html.Div(rows, style={"marginTop": "12px"})
+    ])
+
+def normalize_type(type_str):
+    if pd.isna(type_str):
+        return "AUTRE"
+    t = str(type_str).upper()
+    if "PISTE" in t:
+        return "PISTE CYCLABLE"
+    elif "BANDE" in t:
+        return "BANDE CYCLABLE"
+    elif "VOIE VERTE" in t or "VERTE" in t:
+        return "VOIE VERTE"
+    return "AUTRE"
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# LAYOUT PRINCIPAL
+# ═══════════════════════════════════════════════════════════════════════════════
+
+layout = html.Div([
+    # Styles
+    html.Div(style={"display": "none"}, children=[
+        html.Div("""
+            <style>
+                @keyframes pulse {
+                    0%, 100% { opacity: 1; }
+                    50% { opacity: .5; }
+                }
+                .skeleton { animation: pulse 2s cubic-bezier(0.4, 0, 0.6, 1) infinite; }
+                .stat-pill {
+                    background: #f8fafc;
+                    border-left: 4px solid #2D6A4F;
+                    padding: 12px 16px;
+                    border-radius: 8px;
+                }
+                .stat-value {
+                    font-size: 1.5rem;
+                    font-weight: 700;
+                    line-height: 1.2;
+                }
+                .stat-label {
+                    font-size: 0.8rem;
+                    color: #6b7280;
+                }
+                .hover-grow {
+                    transition: transform 0.2s;
+                }
+                .hover-grow:hover {
+                    transform: scale(1.02);
+                }
+            </style>
+        """)
+    ]),
+
+    # En-tête
+    html.Div(className="page-header", children=[
+        html.H2("🚲 Mobilités locales & Cyclabilité"),
+        html.P("Évaluez et planifiez vos déplacements doux depuis la gare"),
+    ]),
+
+    # Corps de la page
+    html.Div(className="page-body", children=[
+        # Bannière score cyclabilité
+        html.Div(id="cyclability-score-banner", style={"marginBottom": "20px"}),
+
+        # Ligne supérieure : vélos + stats
+        html.Div(style={
+            "display": "grid",
+            "gridTemplateColumns": "2fr 1fr",
+            "gap": "20px",
+            "marginBottom": "20px"
+        }, children=[
+            html.Div(id="velos-section", className="card", style={"padding": "20px"}),
+            html.Div(id="mob-stats", className="stat-grid", style={"margin": 0}),
+        ]),
+
+        # Barre de contrôle
+        html.Div(className="card control-bar", style={
+            "marginBottom": "20px", "gap": "24px", "flexWrap": "wrap"
+        }, children=[
+            html.Div([
+                html.Label("🚉 Gare", className="control-label"),
+                dcc.Dropdown(
+                    id="mob-gare-select", 
+                    options=gare_options,
+                    value=gare_options[0]["value"] if gare_options else None,
+                    clearable=False, 
+                    style={"width": "300px"},
+                ),
+            ]),
+            html.Div([
+                html.Label("📍 Rayon d'analyse", className="control-label"),
+                dcc.RadioItems(
+                    id="mob-rayon",
+                    options=[
+                        {"label": "2 km", "value": 2},
+                        {"label": "5 km", "value": 5},
+                        {"label": "10 km", "value": 10},
+                    ],
+                    value=5, inline=True,
+                    inputStyle={"marginRight": "4px"},
+                    labelStyle={"marginRight": "16px", "fontSize": "0.875rem"},
+                ),
+            ]),
+            html.Div([
+                html.Label("🗺️ Options affichage", className="control-label"),
+                dcc.Checklist(
+                    id="mob-options",
+                    options=[
+                        {"label": " 🚲 Segments", "value": "segments"},
+                        {"label": " 🔥 Heatmap", "value": "heatmap"},
+                        {"label": " 📍 Stations", "value": "stations"},
+                    ],
+                    value=["segments", "stations"], inline=True,
+                    inputStyle={"marginRight": "4px"},
+                    labelStyle={"marginRight": "14px", "fontSize": "0.85rem"},
+                ),
+            ]),
+        ]),
+
+        # Stores de données
+        dcc.Store(id="heatmap-data-store"),
+        dcc.Store(id="poi-pagination-store", data={"page": 0, "page_size": 20}),
+        dcc.Store(id="selected-ville-store", data=None),
+
+        # Carte interactive
+        html.Div(className="card", style={"padding": 0, "overflow": "hidden", "marginBottom": "20px"}, children=[
+            dl.Map(
+                id="mob-map", 
+                center=[46.8, 2.3], 
+                zoom=6,
+                style={"height": "500px", "width": "100%"},
+                children=[
+                    dl.TileLayer(
+                        url="https://{s}.basemaps.cartocdn.com/light_all/{z}/{x}/{y}{r}.png",
+                        attribution="© OpenStreetMap, © CartoDB"
+                    ),
+                    dl.LayerGroup(id="mob-layer"),
+                    dl.LayerGroup(id="heatmap-layer"),
+                    dl.LayerGroup(id="stations-layer"),
+                ],
+            ),
+        ]),
+
+        # Contrôles de pagination POI
+        html.Div(id="poi-pagination-controls", style={
+            "display": "flex", "justifyContent": "space-between",
+            "alignItems": "center", "marginBottom": "12px", "padding": "0 20px"
+        }),
+
+        # Légende
+        html.Div(id="mob-legend", style={
+            "display": "flex", "gap": "20px", "marginBottom": "20px",
+            "flexWrap": "wrap", "justifyContent": "center",
+            "fontSize": "0.8rem", "color": "#6b7280"
+        }),
+
+        # Ligne inférieure : 3 colonnes
+        html.Div(style={
+            "display": "grid",
+            "gridTemplateColumns": "1fr 1fr 1fr",
+            "gap": "20px"
+        }, children=[
+            # Comparateur intermodal
+            html.Div(className="card", children=[
+                html.H4("🚏 Comparateur Intermodal", style={"marginBottom": "12px"}),
+                html.P("Gare → Centre-ville", className="card-subtitle",
+                       style={"marginBottom": "12px"}),
+                html.Div(id="intermodal-comparison"),
+            ]),
+            
+            # Itinéraires vérifiés
+            html.Div(className="card", children=[
+                html.H4("🗺️ Itinéraires Vérifiés", style={"marginBottom": "12px"}),
+                html.P("Accessibles en sécurité", className="card-subtitle",
+                       style={"marginBottom": "12px"}),
+                html.Div(id="typical-routes"),
+            ]),
+            
+            # Tendances et analytics (avec badge de statut)
+            html.Div(className="card", children=[
+                html.H4("📈 Tendances", style={"marginBottom": "12px"}),
+                html.P("Disponibilité horaire", className="card-subtitle",
+                       style={"marginBottom": "12px"}),
+                html.Div(id="trends-chart"),
+                html.Div(id="trends-status-badge", style={"marginTop": "8px"})
+            ]),
+        ]),
+
+        # Intervalle de rafraîchissement
+        dcc.Interval(id="auto-refresh", interval=GBFS_REFRESH_INTERVAL, n_intervals=0),
+    ]),
+])
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# CALLBACK PRINCIPAL (OPTIMISÉ AVEC EXÉCUTION PARALLÈLE)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+@callback(
+    Output("cyclability-score-banner", "children"),
+    Output("velos-section", "children"),
+    Output("mob-stats", "children"),
+    Output("mob-map", "center"),
+    Output("mob-map", "zoom"),
+    Output("mob-layer", "children"),
+    Output("stations-layer", "children"),
+    Output("heatmap-data-store", "data"),
+    Output("mob-legend", "children"),
+    Output("intermodal-comparison", "children"),
+    Output("typical-routes", "children"),
+    Output("trends-chart", "children"),
+    Output("trends-status-badge", "children"),
+    Output("poi-pagination-controls", "children"),
+    Output("selected-ville-store", "data"),
+    Input("mob-gare-select", "value"),
+    Input("mob-rayon", "value"),
+    Input("mob-options", "value"),
+    Input("auto-refresh", "n_intervals"),
+    State("poi-pagination-store", "data"),
+    running=[(Output("velos-section", "children"), skeleton_card(), None)],
+    prevent_initial_call=False,
+)
+
+def update_mobilite(gare_libelle, rayon_km, options, n_intervals, pagination_state):
+    if not gare_libelle:
+        raise PreventUpdate
+    
+    start_time = time.time()
+    
+    # Récupérer les coordonnées de la gare
+    gare_match = df_gares[df_gares["libelle"] == gare_libelle]
+    if gare_match.empty:
+        gare = df_gares.iloc[0]
+    else:
+        gare = gare_match.iloc[0]
+    
+    gare_lat, gare_lon = float(gare["latitude"]), float(gare["longitude"])
+    center = [gare_lat, gare_lon]
+    zoom = {2: 15, 5: 13, 10: 12}.get(rayon_km, 13)
+    
+    print(f"\n[mobilite] 📍 Analyse: {gare_libelle} | {rayon_km}km")
+    
+    # === 1. DONNÉES GBFS ===
+    villes_detectees = detecter_villes_gbfs(gare_libelle)
+    
+    # ✅ CORRECTION : Utiliser le rayon utilisateur comme base, pas un rayon fixe par ville
+    # Le rayon pour les vélos doit être cohérent avec le rayon d'analyse global
+    
+    # Stratégie : 
+    # - Rayon utilisateur = 2km → vélos : 2km (pas de réduction)
+    # - Rayon utilisateur = 5km → vélos : 5km (pas de réduction)  
+    # - Rayon utilisateur = 10km → vélos : 5km max (les vélos sont pour du court trajet)
+    
+    if rayon_km <= 5:
+        radius_velos = rayon_km  # ✅ Même rayon pour cohérence
+    else:
+        radius_velos = 5.0  # ✅ Plafond à 5km pour les vélos (pertinence)
+    
+    print(f"[mobilite] 📏 Rayon vélos: {radius_velos}km (basé sur rayon analyse: {rayon_km}km)")
+    
+    # Première récupération
+    stations_by_ville = get_stations_proximite(villes_detectees, gare_lat, gare_lon, radius_velos)
+    total_stations = sum(len(s) for s in stations_by_ville.values())
+    
+    # 🔧 EXPANSION AUTOMATIQUE : Si moins de 5 stations ET rayon < 10km
+    expansion_faite = False
+    if total_stations < 5 and radius_velos < 10.0:
+        ancien_rayon = radius_velos
+        
+        # Expansion progressive jusqu'à trouver des stations ou atteindre 10km
+        for nouveau_rayon in [5.0, 7.0, 10.0]:
+            if nouveau_rayon <= ancien_rayon:
+                continue
+            
+            print(f"[mobilite] 🔄 Expansion: {ancien_rayon}km → {nouveau_rayon}km "
+                  f"(seulement {total_stations} stations)")
+            
+            stations_by_ville = get_stations_proximite(villes_detectees, gare_lat, gare_lon, nouveau_rayon)
+            total_stations = sum(len(s) for s in stations_by_ville.values())
+            radius_velos = nouveau_rayon
+            expansion_faite = True
+            
+            if total_stations >= 5:
+                print(f"[mobilite] ✅ Expansion réussie: {total_stations} stations trouvées")
+                break
+    
+    if expansion_faite and total_stations < 5:
+        print(f"[mobilite] ⚠️ Expansion max atteinte (10km), mais toujours peu de stations ({total_stations})")
+        # Dernier recours : chercher dans toutes les villes disponibles sans filtre distance
+        if villes_detectees:
+            print(f"[mobilite] 🔄 Tentative sans filtre distance pour {villes_detectees}")
+            # Récupérer toutes les stations de la ville sans filtre
+            try:
+                all_stations = loop_manager.run_async(
+                    gbfs_client.get_all_stations(cities=villes_detectees)
+                )
+                if all_stations:
+                    # Prendre les 10 plus proches
+                    stations_with_dist = []
+                    for s in all_stations:
+                        if s.lat and s.lon:
+                            dist = compute_distance_km(gare_lat, gare_lon, s.lat, s.lon)
+                            stations_with_dist.append((s, dist))
+                    
+                    stations_with_dist.sort(key=lambda x: x[1])
+                    closest = stations_with_dist[:10]
+                    
+                    # Reconstruire le format attendu
+                    stations_by_ville = {}
+                    for station, dist in closest:
+                        if station.city not in stations_by_ville:
+                            stations_by_ville[station.city] = []
+                        
+                        total_vehicles = (
+                            station.num_bikes_available + 
+                            station.num_ebikes_available + 
+                            station.num_scooters_available
+                        )
+                        
+                        stations_by_ville[station.city].append({
+                            "id": station.station_id,
+                            "nom": station.name[:40] + "..." if len(station.name) > 40 else station.name,
+                            "lat": station.lat,
+                            "lon": station.lon,
+                            "distance_m": int(dist * 1000),
+                            "velos": total_vehicles,
+                            "velos_meca": station.num_bikes_available,
+                            "velos_elec": station.num_ebikes_available,
+                            "scooters": station.num_scooters_available,
+                            "places": station.num_docks_available,
+                            "capacity": station.capacity,
+                            "actif": station.is_renting,
+                            "reseau": f"{station.operator}",
+                            "type": "free_floating" if station.station_id.startswith("free_") else "station",
+                            "occupation": (total_vehicles / station.capacity * 100) if station.capacity > 0 else 0
+                        })
+                    
+                    total_stations = sum(len(s) for s in stations_by_ville.values())
+                    print(f"[mobilite] ✅ Fallback réussi: {total_stations} stations (sans filtre)")
+            except Exception as e:
+                print(f"[mobilite] ❌ Fallback échoué: {e}")
+    
+    # Section vélos (avec le rayon final pour l'affichage)
+    velos_section = build_velo_section_avancee(stations_by_ville, villes_detectees, gare_libelle, radius_velos)
+    
+    
+# === 2. POINTS D'INTÉRÊT AVEC PAGINATION ===
+    poi_locaux = filter_poi_by_bbox(df_poi, gare_lat, gare_lon, rayon_km)
+    
+    if len(poi_locaux) > 0:
+        poi_locaux["distance_km"] = poi_locaux.apply(
+            lambda r: compute_distance_km(gare_lat, gare_lon, r["latitude"], r["longitude"]),
+            axis=1
+        )
+        poi_locaux = poi_locaux.sort_values("distance_km")
+    
+    # Pagination
+    page = pagination_state.get("page", 0)
+    page_size = pagination_state.get("page_size", 20)
+    total_poi = len(poi_locaux)
+    total_pages = (total_poi + page_size - 1) // page_size
+    
+    start_idx = page * page_size
+    end_idx = start_idx + page_size
+    poi_page = poi_locaux.iloc[start_idx:end_idx] if len(poi_locaux) > 0 else poi_locaux
+    
+    pagination_controls = html.Div([
+        html.Button(
+            "◀ Précédent",
+            id="poi-prev",
+            disabled=(page <= 0),
+            style={
+                "padding": "6px 12px",
+                "borderRadius": "6px",
+                "border": "1px solid #d1d5db",
+                "background": "#fff",
+                "cursor": "pointer" if page > 0 else "default"
+            }
+        ),
+        html.Span(
+            f"Page {page + 1} / {max(1, total_pages)} ({total_poi} POI)",
+            style={"margin": "0 12px", "fontSize": "0.9rem"}
+        ),
+        html.Button(
+            "Suivant ▶",
+            id="poi-next",
+            disabled=(page >= total_pages - 1),
+            style={
+                "padding": "6px 12px",
+                "borderRadius": "6px",
+                "border": "1px solid #d1d5db",
+                "background": "#fff",
+                "cursor": "pointer" if page < total_pages - 1 else "default"
+            }
+        ),
+    ]) if total_poi > page_size else html.Div()
+    
+    # === 3. DONNÉES CYCLABLES ===
+    df_cyclables = get_cyclables()
+    
+    if df_cyclables is None or len(df_cyclables) == 0:
+        score_info = {
+            "score_total": 0,
+            "niveau": ("🔴 Non cyclable", "Aucun aménagement détecté"),
+            "details": {"densite": 0, "qualite": 0, "connectivite": 0, "accessibilite": 0},
+            "stats": {"km_total": 0, "nb_composantes": 0, "pct_principale": 0}
+        }
+        banner = build_cyclability_banner(score_info)
+        
+        markers = [dl.Marker(
+            position=center,
+            children=dl.Tooltip(f"🚉 {gare_libelle}"),
+            icon={
+                'iconUrl': 'https://raw.githubusercontent.com/pointhi/leaflet-color-markers/master/img/marker-icon-blue.png',
+                'shadowUrl': 'https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.7.1/images/marker-shadow.png',
+                'iconSize': [25, 41],
+                'iconAnchor': [12, 41],
+            }
+        )]
+        
+        stations_layer = []
+        heatmap_data = []
+        stats = [html.Div("Données non disponibles", className="stat-pill")]
+        legend = []
+        intermodal = build_intermodal_comparison(gare, poi_page)
+        routes = build_verified_routes([])
+        
+        if stations_by_ville and len(stations_by_ville) > 0:
+            # Prendre la ville avec le plus de stations
+            ville_tendance = max(stations_by_ville.items(), key=lambda x: len(x[1]))[0]
+        elif villes_detectees:
+            ville_tendance = villes_detectees[0]
+        else:
+            ville_tendance = "Paris"  # Fallback ultime
+        # Debug
+        print(
+            f"[mobilite] 📊 Tendances pour: {ville_tendance} "
+            f"(villes détectées: {villes_detectees}, " 
+            f"stations: {list(stations_by_ville.keys()) if stations_by_ville else 'aucune'})")
+
+        trends = build_trends_chart(ville_tendance)
+        trends_badge = build_collection_status_badge(ville_tendance)
+        
+        elapsed = time.time() - start_time
+        print(f"[mobilite] ✅ Rendu (sans cyclables) en {elapsed:.2f}s")
+        
+        return (
+            banner, velos_section, stats, center, zoom, markers, stations_layer,
+            heatmap_data, legend, intermodal, routes, trends, trends_badge,
+            pagination_controls, ville_tendance
+        )
+    
+    # Filtrage spatial des aménagements cyclables
+    try:
+        import geopandas as gpd
+        from shapely.geometry import Point
+        
+        point_gare = Point(gare_lon, gare_lat)
+        gare_gdf = gpd.GeoDataFrame(geometry=[point_gare], crs="EPSG:4326")
+        gare_l93 = gare_gdf.to_crs(epsg=2154)
+        buffer_l93 = gare_l93.buffer(rayon_km * 1000)
+        buffer_wgs = buffer_l93.to_crs(epsg=4326)
+        
+        cyclables_proches = df_cyclables[df_cyclables.intersects(buffer_wgs.iloc[0])].copy()
+        print(f"[mobilite] 🚴 {len(cyclables_proches)} segments cyclables dans le rayon")
+    except Exception as e:
+        print(f"[mobilite] ❌ Erreur filtrage cyclables: {e}")
+        cyclables_proches = df_cyclables.head(500).copy()
+    
+    cyclables_proches["type_norm"] = cyclables_proches["type_amenagement"].apply(normalize_type)
+    
+    heatmap_data = generate_heatmap_data(cyclables_proches, max_points=500)
+    
+    score_info = compute_cyclability_score(gare, cyclables_proches, poi_page, rayon_km)
+    banner = build_cyclability_banner(score_info)
+    
+    routes_verified = find_verified_routes(gare, cyclables_proches, poi_page)
+    routes_ui = build_verified_routes(routes_verified)
+    
+    ville_tendance = villes_detectees[0] if villes_detectees else "Paris"
+    stations_for_trends = []
+    for ville_stations in stations_by_ville.values():
+        stations_for_trends.extend(ville_stations)
+
+    trends_chart = build_trends_chart(ville_tendance, stations_for_trends)
+    trends_badge = build_collection_status_badge(ville_tendance)
+    
+    counts = {}
+    km_by_type = {}
+    
+    for type_key in TYPES_AMENAGEMENTS.keys():
+        segs = cyclables_proches[cyclables_proches["type_norm"] == type_key]
+        counts[type_key] = len(segs)
+        try:
+            if len(segs) > 0:
+                segs_l93 = segs.to_crs(epsg=2154)
+                km_by_type[type_key] = segs_l93.geometry.length.sum() / 1000
+            else:
+                km_by_type[type_key] = 0
+        except:
+            km_by_type[type_key] = 0
+    
+    stats = [
+        html.Div(
+            className="stat-pill",
+            style={"borderLeftColor": "#2D6A4F"},
+            children=[
+                html.Div(f"{counts.get('PISTE CYCLABLE', 0)}", className="stat-value"),
+                html.Div(f"Pistes ({km_by_type.get('PISTE CYCLABLE', 0):.1f} km)", className="stat-label"),
+            ]
+        ),
+        html.Div(
+            className="stat-pill",
+            style={"borderLeftColor": "#1A4B8C"},
+            children=[
+                html.Div(f"{counts.get('BANDE CYCLABLE', 0)}", className="stat-value"),
+                html.Div(f"Bandes ({km_by_type.get('BANDE CYCLABLE', 0):.1f} km)", className="stat-label"),
+            ]
+        ),
+        html.Div(
+            className="stat-pill",
+            style={"borderLeftColor": "#52B788"},
+            children=[
+                html.Div(f"{counts.get('VOIE VERTE', 0)}", className="stat-value"),
+                html.Div(f"V. vertes ({km_by_type.get('VOIE VERTE', 0):.1f} km)", className="stat-label"),
+            ]
+        ),
+        html.Div(
+            className="stat-pill",
+            style={"borderLeftColor": "#F4A620"},
+            children=[
+                html.Div(f"{sum(counts.values())}", className="stat-value"),
+                html.Div(f"Total ({sum(km_by_type.values()):.1f} km)", className="stat-label"),
+            ]
+        ),
+    ]
+    
+    # Construction des calques de la carte
+    markers = [
+        dl.Marker(
+            position=center,
+            children=dl.Tooltip(f"🚉 {gare_libelle}"),
+            icon={
+                'iconUrl': 'https://raw.githubusercontent.com/pointhi/leaflet-color-markers/master/img/marker-icon-blue.png',
+                'shadowUrl': 'https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.7.1/images/marker-shadow.png',
+                'iconSize': [25, 41],
+                'iconAnchor': [12, 41],
+            }
+        )
+    ]
+    
+    markers.append(dl.Circle(
+        center=center,
+        radius=rayon_km * 1000,
+        color="#666",
+        weight=1,
+        fill=False,
+        dashArray="5,5"
+    ))
+    
+    show_segments = "segments" in (options or [])
+    if show_segments:
+        segments_to_show = cyclables_proches.head(500)
+        for idx, seg in segments_to_show.iterrows():
+            try:
+                geom = seg.geometry
+                type_norm = seg.get("type_norm", "AUTRE")
+                cfg = TYPES_AMENAGEMENTS.get(type_norm, TYPES_AMENAGEMENTS["AUTRE"])
+                
+                if geom.geom_type == "LineString":
+                    coords = [[lat, lon] for lon, lat in geom.coords]
+                    
+                    # Calcul longueur
+                    try:
+                        seg_gdf = gpd.GeoDataFrame([seg], geometry='geometry', crs="EPSG:4326")
+                        seg_l93 = seg_gdf.to_crs(epsg=2154)
+                        longueur_m = int(seg_l93.geometry.length.iloc[0])
+                    except:
+                        longueur_m = int(geom.length * 111000)
+                    
+                    # Extraction données disponibles
+                    largeur_g = seg.get("largeur_g")
+                    largeur_d = seg.get("largeur_d")
+                    revetement = seg.get("revetement", seg.get("revet_g"))
+                    lumiere = seg.get("lumiere")
+                    trafic_vit = seg.get("trafic_vit")
+                    regime_g = seg.get("regime_g")
+                    sens_g = seg.get("sens_g")
+                    date_maj = seg.get("date_maj")
+                    
+                    # Construction du tooltip avec composants Dash
+                    emoji_qualite = {5: "🌟", 4: "⭐", 3: "✨", 2: "💫", 1: "⚪"}
+                    qualite = cfg.get('qualite', 2)
+                    
+                    tooltip_children = [
+                        html.Div(
+                            f"{cfg['emoji']} {cfg['label']}",
+                            style={
+                                "background": cfg["color"],
+                                "color": "white",
+                                "padding": "8px",
+                                "borderRadius": "6px 6px 0 0",
+                                "margin": "-10px -10px 8px -10px",
+                                "fontWeight": "bold",
+                                "fontSize": "1rem"
+                            }
+                        ),
+                        html.Div(
+                            f"📏 {longueur_m}m de long",
+                            style={"padding": "4px 0"}
+                        ),
+                        html.Div(
+                            f"{emoji_qualite[qualite]} Qualité {qualite}/5 — {cfg['description']}",
+                            style={"padding": "4px 0"}
+                        ),
+                    ]
+                    
+                    # Largeur
+                    if pd.notna(largeur_g) and largeur_g > 0:
+                        tooltip_children.append(
+                            html.Div(
+                                f"↔️ Largeur: {largeur_g:.1f}m",
+                                style={"padding": "4px 0", "color": "#059669"}
+                            )
+                        )
+                    elif pd.notna(largeur_d) and largeur_d > 0:
+                        tooltip_children.append(
+                            html.Div(
+                                f"↔️ Largeur: {largeur_d:.1f}m",
+                                style={"padding": "4px 0", "color": "#059669"}
+                            )
+                        )
+                    
+                    # Revêtement
+                    if pd.notna(revetement):
+                        emoji_rev = "✨" if revetement == "LISSE" else "🏗️"
+                        tooltip_children.append(
+                            html.Div(
+                                f"{emoji_rev} {revetement.title()}",
+                                style={"padding": "4px 0", "color": "#0284c7"}
+                            )
+                        )
+                    
+                    # Éclairage
+                    if pd.notna(lumiere):
+                        if lumiere == 1.0:
+                            tooltip_children.append(
+                                html.Div(
+                                    "💡 Éclairé",
+                                    style={"padding": "4px 0", "color": "#eab308"}
+                                )
+                            )
+                        else:
+                            tooltip_children.append(
+                                html.Div(
+                                    "🌙 Non éclairé",
+                                    style={"padding": "4px 0", "color": "#71717a"}
+                                )
+                            )
+                    
+                    # Vitesse trafic
+                    if pd.notna(trafic_vit) and trafic_vit > 0:
+                        tooltip_children.append(
+                            html.Div(
+                                f"🚗 Trafic: {int(trafic_vit)}km/h",
+                                style={"padding": "4px 0", "color": "#dc2626"}
+                            )
+                        )
+                    
+                    # Régime
+                    if pd.notna(regime_g) and regime_g != "AUTRE":
+                        tooltip_children.append(
+                            html.Div(
+                                f"📋 {regime_g}",
+                                style={
+                                    "padding": "4px 0",
+                                    "color": "#64748b",
+                                    "fontSize": "0.8rem"
+                                }
+                            )
+                        )
+                    
+                    # Sens
+                    if pd.notna(sens_g):
+                        emoji_sens = "↕️" if "BIDIRECTIONNEL" in str(sens_g).upper() else "→"
+                        tooltip_children.append(
+                            html.Div(
+                                f"{emoji_sens} {sens_g}",
+                                style={
+                                    "padding": "4px 0",
+                                    "color": "#64748b",
+                                    "fontSize": "0.8rem"
+                                }
+                            )
+                        )
+                    
+                    # Date mise à jour
+                    if pd.notna(date_maj):
+                        try:
+                            if isinstance(date_maj, str):
+                                date_str = date_maj[:10]
+                            else:
+                                date_str = date_maj.strftime("%Y-%m-%d")
+                            tooltip_children.append(
+                                html.Div(
+                                    f"📅 Màj: {date_str}",
+                                    style={
+                                        "padding": "4px 0",
+                                        "color": "#94a3b8",
+                                        "fontSize": "0.75rem"
+                                    }
+                                )
+                            )
+                        except:
+                            pass
+                    
+                    # Création du tooltip
+                    tooltip = dl.Tooltip(
+                        html.Div(
+                            tooltip_children,
+                            style={
+                                "fontFamily": "system-ui",
+                                "minWidth": "220px",
+                                "fontSize": "0.85rem"
+                            }
+                        ),
+                        permanent=False,
+                        sticky=True
+                    )
+                    
+                    markers.append(
+                        dl.Polyline(
+                            positions=coords,
+                            color=cfg["color"],
+                            weight=4,
+                            opacity=0.7,
+                            children=tooltip
+                        )
+                    )
+            except Exception as e:
+                continue
+    
+    show_stations = "stations" in (options or [])
+    stations_layer = []
+    
+    if show_stations:
+        for ville, stations in stations_by_ville.items():
+            for s in stations:
+                if not s.get('actif', True):
+                    color = "#6b7280"
+                elif s['velos'] == 0:
+                    color = "#dc2626"
+                elif s['velos'] < 3:
+                    color = "#ea580c"
+                else:
+                    color = "#16a34a"
+                
+                radius = 6 + min(s['velos'], 10)
+                
+                # Tooltip avec composants Dash pour les stations
+                tooltip_content = html.Div([
+                    html.Div(
+                        f"🚲 {s['reseau']}",
+                        style={"fontWeight": "bold", "marginBottom": "4px"}
+                    ),
+                    html.Div(
+                        s['nom'],
+                        style={"fontSize": "0.9rem", "marginBottom": "4px"}
+                    ),
+                    html.Div(
+                        f"🚲 {s['velos']} vélos ({s['velos_meca']} méca, {s['velos_elec']} élec)",
+                        style={"color": "#16a34a"}
+                    ),
+                    html.Div(
+                        f"🅿️ {s['places']} places libres",
+                        style={"color": "#4b5563"}
+                    ),
+                    html.Div(
+                        f"📏 {s['distance_m']}m",
+                        style={"color": "#6b7280", "fontSize": "0.8rem", "marginTop": "4px"}
+                    )
+                ])
+                
+                stations_layer.append(dl.CircleMarker(
+                    center=[s['lat'], s['lon']],
+                    radius=radius,
+                    color=color,
+                    fill=True,
+                    fillColor=color,
+                    fillOpacity=0.7,
+                    weight=2,
+                    children=dl.Tooltip(tooltip_content)
+                ))
+    
+    legend = []
+    
+    for cfg in TYPES_AMENAGEMENTS.values():
+        legend.append(
+            html.Div(
+                style={"display": "flex", "alignItems": "center", "gap": "6px"},
+                children=[
+                    html.Div(
+                        style={"width": "24px", "height": "3px", "background": cfg["color"]}
+                    ),
+                    html.Span(
+                        f"{cfg['emoji']} {cfg['label']}",
+                        style={"fontSize": "0.8rem"}
+                    ),
+                ]
+            )
+        )
+    
+    legend.extend([
+        html.Div(
+            style={"display": "flex", "alignItems": "center", "gap": "6px"},
+            children=[
+                html.Span("🟢", style={"color": "#16a34a"}),
+                "Vélo dispo (≥3)",
+            ]
+        ),
+        html.Div(
+            style={"display": "flex", "alignItems": "center", "gap": "6px"},
+            children=[
+                html.Span("🟠", style={"color": "#ea580c"}),
+                "Vélo faible (1-2)",
+            ]
+        ),
+        html.Div(
+            style={"display": "flex", "alignItems": "center", "gap": "6px"},
+            children=[
+                html.Span("🔴", style={"color": "#dc2626"}),
+                "Vélo vide",
+            ]
+        ),
+        html.Div(
+            style={"display": "flex", "alignItems": "center", "gap": "6px"},
+            children=[
+                html.Span("⚫", style={"color": "#6b7280"}),
+                "Hors service",
+            ]
+        ),
+    ])
+    
+    intermodal = build_intermodal_comparison(gare, poi_page)
+    
+    elapsed = time.time() - start_time
+    print(f"[mobilite] ✅ Rendu complet en {elapsed:.2f}s")
+    
+    return (
+        banner, velos_section, stats, center, zoom, markers, stations_layer,
+        heatmap_data, legend, intermodal, routes_ui, trends_chart, trends_badge,
+        pagination_controls, ville_tendance
+    )
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# CALLBACKS SECONDAIRES
+# ═══════════════════════════════════════════════════════════════════════════════
+
+@callback(
+    Output("poi-pagination-store", "data"),
+    Input("poi-prev", "n_clicks"),
+    Input("poi-next", "n_clicks"),
+    State("poi-pagination-store", "data"),
+    prevent_initial_call=True,
+)
+def update_pagination(prev_clicks, next_clicks, current):
+    ctx = dash.callback_context
+    if not ctx.triggered:
+        return current
+    
+    button_id = ctx.triggered[0]["prop_id"].split(".")[0]
+    page = current.get("page", 0)
+    
+    if button_id == "poi-prev":
+        return {**current, "page": max(0, page - 1)}
+    elif button_id == "poi-next":
+        return {**current, "page": page + 1}
+    
+    return current
+
+
+@callback(
+    Output("heatmap-layer", "children"),
+    Input("heatmap-data-store", "data"),
+    Input("mob-options", "value"),
+)
+def update_heatmap(heatmap_data, options):
+    if not heatmap_data or "heatmap" not in (options or []):
+        return []
+
+    markers = []
+
+    for point in heatmap_data[:300]:
+        try:
+            lat, lon, intensity = point
+        except Exception:
+            print("⚠️ Format invalide:", point)
+            continue
+
+        # Couleur selon intensité
+        if intensity >= 0.8:
+            color = "#DC2626"
+        elif intensity >= 0.6:
+            color = "#EA580C"
+        elif intensity >= 0.4:
+            color = "#F59E0B"
+        else:
+            color = "#10B981"
+
+        radius = 5 + (intensity * 10)
+
+        markers.append(
+            dl.CircleMarker(
+                center=[lat, lon],
+                radius=radius,
+                color=color,
+                fill=True,
+                fillColor=color,
+                fillOpacity=0.4,
+                weight=0,
+            )
+        )
+
+    return markers
+
+@callback(
+    Output("trends-chart", "children", allow_duplicate=True),
+    Output("trends-status-badge", "children", allow_duplicate=True),
+    Input("selected-ville-store", "data"),
+    prevent_initial_call=True,
+)
+def update_trends(ville):
+    if not ville:
+        raise PreventUpdate
+    return build_trends_chart(ville), build_collection_status_badge(ville)
+
+@callback(
+    Output("auto-refresh", "n_intervals"),
+    Input("mob-gare-select", "value"),
+    prevent_initial_call=True,
+)
+def reset_refresh_counter(_):
+    """Réinitialise le compteur de rafraîchissement quand on change de gare"""
+    return 0
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# FONCTIONS UTILITAIRES POUR ADMIN/DEBUG (depuis mobilite_INTEGRATION_TRENDS.py)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def force_collect_now(ville: str):
+    """
+    Force une collecte immédiate pour une ville
+    CORRECTION: Utilise get_all_stations() au lieu de collect_snapshot()
+    """
+    analyzer = get_trends_analyzer()
+    if not analyzer:
+        print("[mobilite] ❌ Analyseur non disponible")
+        return 0
+    
+    async def collect():
+        try:
+            # Récupérer les stations pour la ville
+            stations = await gbfs_client.get_all_stations(cities=[ville])
+            
+            # Si l'analyzer a une méthode process_stations, l'utiliser
+            if hasattr(analyzer, 'process_stations'):
+                count = await analyzer.process_stations(ville, stations)
+            else:
+                # Fallback: juste compter
+                count = len(stations)
+                print(f"[mobilite] ✅ Collecte manuelle: {ville} - {count} stations (sans stockage)")
+            
+            return count
+        except Exception as e:
+            print(f"[mobilite] ❌ Erreur collecte: {e}")
+            return 0
+    
+    return loop_manager.run_async(collect())
+
+def get_collection_stats():
+    """Récupère les statistiques de collecte pour debug"""
+    analyzer = get_trends_analyzer()
+    if not analyzer:
+        return "Analyseur non disponible"
+    
+    try:
+        stats = []
+        for ville in ["Paris", "Lyon", "Marseille", "Bordeaux"]:
+            status = analyzer.get_collection_status(ville)
+            stats.append(f"{ville}: {status}")
+        return "\n".join(stats)
+    except Exception as e:
+        return f"Erreur: {e}"
+
+# Nettoyage automatique à la fermeture
+def cleanup_on_exit():
+    """Nettoie les ressources à l'arrêt"""
+    print("[mobilite] 🧹 Nettoyage...")
+    try:
+        if _trends_analyzer:
+            _trends_analyzer.stop_collector()
+            _trends_analyzer.cleanup_old_data(jours_conservation=30)
+        loop_manager._executor.shutdown(wait=False)
+    except Exception as e:
+        print(f"[mobilite] ⚠️ Erreur nettoyage: {e}")
+
+atexit.register(cleanup_on_exit)

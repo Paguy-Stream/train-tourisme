@@ -1,0 +1,58 @@
+# ── Données volumineuses ──────────────────────────────────────────────────────
+# Base SQLite GBFS (recréée automatiquement au démarrage)
+data/gbfs_trends.db
+data/*.db
+*.db
+
+# Données brutes téléchargeables depuis les sources officielles
+# (voir README.md section "Données volumineuses")
+data/raw/poi.csv
+data/raw/Base_Carbone_V23.9.csv
+
+# ── Caches ────────────────────────────────────────────────────────────────────
+cache/
+.cache/
+cache/weather/
+
+# ── Logs ──────────────────────────────────────────────────────────────────────
+*.log
+trf2netex.log
+
+# ── Environnement Python ──────────────────────────────────────────────────────
+venv/
+.venv/
+env/
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+*.egg-info/
+dist/
+build/
+.eggs/
+
+# ── Variables d'environnement ─────────────────────────────────────────────────
+.env
+.env.local
+
+# ── IDE ───────────────────────────────────────────────────────────────────────
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# ── Windows ───────────────────────────────────────────────────────────────────
+Thumbs.db
+desktop.ini
+$RECYCLE.BIN/
+
+# ── macOS ─────────────────────────────────────────────────────────────────────
+.DS_Store
+.AppleDouble
+
+# ── Scripts de développement ──────────────────────────────────────────────────
+analyse_fichiers.py
+prepare_deploy.py
+audit_fichiers.txt
+diagnostic_*.py

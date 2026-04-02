@@ -1,0 +1,566 @@
+/* ─── TRAIN TOURISME — Identité visuelle & Structure ─────────────────────── */
+
+@import url('https://fonts.googleapis.com/css2?family=Syne:wght@400;600;700;800&family=DM+Sans:ital,wght@0,300;0,400;0,500;1,300&display=swap');
+
+:root {
+  --rouge-sncf:    #E2001A;
+  --bleu-nuit:     #0B1F3A;
+  --bleu-rail:     #1A4B8C;
+  --creme:         #F5F0E8;
+  --gris-quai:     #C8C4BC;
+  --vert-nature:   #2D6A4F;
+  --or-soleil:     #F4A620;
+
+  --font-display:  'Syne', sans-serif;
+  --font-body:     'DM Sans', sans-serif;
+
+  --radius:        12px;
+  --shadow-card:   0 4px 24px rgba(11,31,58,0.10);
+  --transition:    0.25s cubic-bezier(0.4, 0, 0.2, 1);
+  --sidebar-width: 240px;
+}
+
+/* ─── Reset ─────────────────────────────────────────────────────────────────*/
+*, *::before, *::after {
+  box-sizing: border-box;
+  margin: 0;
+  padding: 0;
+}
+
+html, body {
+  width: 100%;
+  min-height: 100vh;
+  overflow-x: hidden;
+}
+
+body {
+  font-family: var(--font-body);
+  background-color: var(--creme);
+  color: var(--bleu-nuit);
+}
+
+/* ─── Dash root wrappers — CRITIQUE pour pleine largeur ────────────────────*/
+/*
+ * Dash injecte plusieurs wrappers entre <body> et notre layout :
+ * #react-entry-point > ._dash-loading > #_dash-app-content > etc.
+ * Tous doivent être 100% largeur, sinon le contenu est étriqué.
+ */
+#react-entry-point,
+._dash-loading,
+#_dash-app-content,
+._dash-loading-callback,
+[id^="_dash"],
+.dash-renderer {
+  width: 100% !important;
+  max-width: 100% !important;
+  min-height: 100vh;
+}
+
+/* ─── Sidebar ────────────────────────────────────────────────────────────────*/
+#sidebar {
+  position: fixed;
+  top: 0; left: 0;
+  width: var(--sidebar-width);
+  height: 100vh;
+  background: var(--bleu-nuit);
+  display: flex;
+  flex-direction: column;
+  z-index: 2000;
+  overflow: hidden;
+}
+
+#sidebar::before {
+  content: '';
+  height: 4px;
+  background: var(--rouge-sncf);
+  flex-shrink: 0;
+}
+
+.sidebar-logo {
+  padding: 28px 24px 20px;
+  border-bottom: 1px solid rgba(255,255,255,0.08);
+}
+
+.sidebar-logo h1 {
+  font-family: var(--font-display);
+  font-size: 1.15rem;
+  font-weight: 800;
+  color: #fff;
+}
+
+.nav-link {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 14px 24px;
+  color: rgba(255,255,255,0.65);
+  text-decoration: none;
+  font-size: 0.9rem;
+  transition: var(--transition);
+}
+
+.nav-link:hover {
+  color: #fff;
+  background: rgba(255,255,255,0.05);
+}
+
+.nav-link.active {
+  color: #fff;
+  background: rgba(226,0,26,0.15);
+  border-left: 4px solid var(--rouge-sncf);
+}
+
+/* ─── Contenu Principal ─────────────────────────────────────────────────────*/
+#page-content {
+  margin-left: var(--sidebar-width);
+  width: calc(100vw - var(--sidebar-width));
+  min-height: 100vh;
+  display: flex;
+  flex-direction: column;
+  overflow-x: hidden;
+}
+
+.page-header {
+  background: #fff;
+  border-bottom: 1px solid rgba(11,31,58,0.08);
+  padding: 24px 40px;
+  width: 100%;
+}
+
+.page-header h2 {
+  font-family: var(--font-display);
+  font-size: 1.6rem;
+  font-weight: 700;
+  margin-bottom: 4px;
+}
+
+.page-header p {
+  color: #6B7280;
+  font-size: 0.95rem;
+}
+
+.page-body {
+  padding: 28px 36px;
+  flex: 1;
+  width: 100%;
+  overflow-x: hidden;
+}
+
+/* ─── Cards ──────────────────────────────────────────────────────────────────*/
+.card {
+  background: #fff;
+  border-radius: var(--radius);
+  box-shadow: var(--shadow-card);
+  padding: 24px;
+  border: 1px solid rgba(11,31,58,0.06);
+  margin-bottom: 20px;
+  width: 100%;
+}
+
+.card-title {
+  font-family: var(--font-display);
+  font-size: 1rem;
+  font-weight: 700;
+  color: var(--bleu-nuit);
+  margin-bottom: 4px !important;
+}
+
+.card-subtitle {
+  font-size: 0.83rem;
+  color: #6B7280;
+}
+
+/* ─── Badges ─────────────────────────────────────────────────────────────────*/
+.badge {
+  display: inline-flex;
+  align-items: center;
+  padding: 3px 10px;
+  border-radius: 999px;
+  font-size: 0.76rem;
+  font-weight: 500;
+}
+.badge-green  { background: rgba(45,106,79,0.10);  color: #2D6A4F; }
+.badge-gold   { background: rgba(244,166,32,0.15); color: #92400E; }
+.badge-blue   { background: rgba(26,75,140,0.10);  color: #1A4B8C; }
+
+/* ─── Contrôle label ─────────────────────────────────────────────────────────*/
+.control-label {
+  display: block;
+  font-size: 0.72rem;
+  font-weight: 700;
+  color: var(--bleu-nuit);
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  margin-bottom: 8px;
+}
+
+/* ════════════════════════════════════════════════════════════════════════════
+   ITINÉRAIRES — Layout spécifique
+   ════════════════════════════════════════════════════════════════════════════*/
+
+/* Config card : grille 5 colonnes (4 dropdowns + 1 bouton) */
+.itin-config-card {
+  margin-bottom: 20px;
+}
+
+.itin-config-grid {
+  display: grid;
+  grid-template-columns: 1fr 1fr 1fr 1fr auto;
+  gap: 16px;
+  align-items: end;
+}
+
+/* Boutons */
+.itin-btn-primary {
+  padding: 12px 28px;
+  background: linear-gradient(135deg, #2D6A4F, #1A4B8C);
+  color: #fff;
+  border: none;
+  border-radius: 8px;
+  font-weight: 700;
+  font-size: 0.95rem;
+  cursor: pointer;
+  white-space: nowrap;
+  transition: var(--transition);
+  width: 100%;
+}
+.itin-btn-primary:hover {
+  transform: translateY(-1px);
+  box-shadow: 0 6px 20px rgba(26,75,140,0.3);
+}
+
+.itin-btn-secondary {
+  padding: 9px 22px;
+  background: var(--or-soleil);
+  color: #fff;
+  border: none;
+  border-radius: 7px;
+  font-weight: 600;
+  font-size: 0.88rem;
+  cursor: pointer;
+  transition: var(--transition);
+}
+.itin-btn-secondary:hover {
+  background: #d4911a;
+}
+
+/* Stats : 4 pills sur une seule ligne */
+.itin-stats-row {
+  display: grid;
+  grid-template-columns: repeat(4, 1fr);
+  gap: 14px;
+  margin-bottom: 20px;
+  width: 100%;
+}
+
+.itin-stat-pill {
+  background: #fff;
+  border-radius: var(--radius);
+  padding: 18px 16px;
+  box-shadow: var(--shadow-card);
+  border-left: 4px solid var(--bleu-rail);
+  text-align: center;
+}
+
+.itin-stat-green  { border-left-color: var(--vert-nature); }
+.itin-stat-blue   { border-left-color: var(--bleu-rail); }
+.itin-stat-gold   { border-left-color: var(--or-soleil); }
+.itin-stat-purple { border-left-color: #7C3AED; }
+
+.stat-value {
+  font-family: var(--font-display);
+  font-size: 1.7rem;
+  font-weight: 800;
+  color: var(--bleu-nuit);
+  line-height: 1.1;
+}
+
+.stat-label {
+  font-size: 0.74rem;
+  color: #6B7280;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  margin-top: 3px;
+}
+
+/* Grille principale résultats : timeline+étapes | carte+benefits */
+.itin-main-grid {
+  display: grid;
+  grid-template-columns: 420px 1fr;
+  gap: 20px;
+  align-items: start;
+  width: 100%;
+}
+
+.itin-col-left {
+  display: flex;
+  flex-direction: column;
+  gap: 0;
+  min-width: 0;
+}
+
+.itin-col-right {
+  display: flex;
+  flex-direction: column;
+  gap: 0;
+  min-width: 0;
+}
+
+/* ─── Carte Leaflet itin-map — Fix complet tiles grises ────────────────────*/
+/*
+ * PROBLÈME : Leaflet s'initialise quand #itin-results a display:none.
+ * Il ne peut pas calculer ses dimensions → tiles grisées.
+ *
+ * SOLUTION :
+ *  1. Le wrapper a une height FIXE et position:relative
+ *  2. La Map a position:absolute top/left/right/bottom:0
+ *  3. Le JS fix_itin_map.js appelle invalidateSize() quand le div devient visible
+ */
+
+#itin-map-wrapper {
+  width: 100% !important;
+  height: 460px !important;
+  position: relative !important;
+  border-radius: 10px !important;
+  overflow: hidden !important;
+  background: #e8e4df;
+  /* isolation empêche z-index sidebar d'interférer */
+  isolation: isolate;
+}
+
+#itin-map {
+  position: absolute !important;
+  inset: 0 !important;
+  width: 100% !important;
+  height: 100% !important;
+  border-radius: 10px !important;
+}
+
+#itin-map .leaflet-container {
+  width: 100% !important;
+  height: 100% !important;
+  background: #e8e4df !important;
+  border-radius: 10px !important;
+}
+
+/* Hiérarchie stricte des calques Leaflet */
+#itin-map .leaflet-tile-pane     { z-index: 100 !important; opacity: 1 !important; }
+#itin-map .leaflet-tile          { opacity: 1 !important; visibility: visible !important; }
+#itin-map .leaflet-overlay-pane  { z-index: 200 !important; }
+#itin-map .leaflet-marker-pane   { z-index: 300 !important; }
+#itin-map .leaflet-tooltip-pane  { z-index: 400 !important; pointer-events: none !important; }
+#itin-map .leaflet-popup-pane    { z-index: 500 !important; }
+#itin-map .leaflet-control       { z-index: 700 !important; }
+
+/* Benefits card */
+.itin-benefits-card {
+  padding: 20px;
+  background: linear-gradient(135deg, #D1FAE5, #DBEAFE);
+  border-radius: var(--radius);
+  border-left: 5px solid var(--vert-nature);
+  margin-top: 0;
+  width: 100%;
+}
+
+.itin-benefits-card h4 {
+  color: var(--vert-nature);
+  font-size: 0.95rem;
+  font-weight: 700;
+}
+
+/* Erreur */
+.itin-error-box {
+  padding: 16px 20px;
+  background: #FEF3C7;
+  border-radius: 12px;
+  border-left: 4px solid var(--or-soleil);
+}
+
+/* ════════════════════════════════════════════════════════════════════════════
+   CARTE ISOCHRONE — iso-map
+   ════════════════════════════════════════════════════════════════════════════*/
+.map-wrapper {
+  width: 100% !important;
+  height: 600px !important;
+  min-width: 0 !important;
+  position: relative !important;
+  overflow: hidden !important;
+  border-radius: var(--radius) !important;
+  background: #e5e3df;
+  isolation: isolate !important;
+}
+
+.map-wrapper .card {
+  width: 100% !important; height: 100% !important;
+  padding: 0 !important; margin: 0 !important;
+  overflow: hidden !important; border-radius: var(--radius) !important;
+  position: relative !important;
+}
+
+.legend-wrapper {
+  width: 320px !important;
+  flex-shrink: 0 !important;
+}
+
+#iso-map {
+  width: 100% !important; height: 100% !important;
+  min-height: 600px !important; border-radius: var(--radius) !important;
+  position: absolute !important; inset: 0;
+  z-index: 1;
+}
+
+#iso-map .leaflet-container {
+  width: 100% !important; height: 100% !important;
+  min-height: 600px !important; border-radius: var(--radius) !important;
+  background: #e5e3df !important;
+}
+
+#iso-map .leaflet-tile-pane    { z-index: 100 !important; }
+#iso-map .leaflet-overlay-pane { z-index: 200 !important; }
+#iso-map .leaflet-marker-pane  { z-index: 300 !important; }
+#iso-map .leaflet-marker-pane > * { z-index: 310 !important; }
+#iso-map .leaflet-tooltip-pane { z-index: 400 !important; pointer-events: none !important; }
+#iso-map .leaflet-popup-pane   { z-index: 500 !important; }
+#iso-map .leaflet-control      { z-index: 700 !important; }
+
+.isochrone-center {
+  fill: var(--rouge-sncf) !important; fill-opacity: 1 !important;
+  stroke: white !important; stroke-width: 3px !important;
+  filter: drop-shadow(0 2px 4px rgba(0,0,0,0.3));
+}
+
+.isochrone-marker {
+  fill: var(--bleu-rail) !important; fill-opacity: 0.9 !important;
+  stroke: white !important; stroke-width: 1.5px !important;
+}
+
+.isochrone-polygon {
+  fill-opacity: 0.20 !important; stroke: var(--bleu-nuit) !important;
+  stroke-width: 2px !important; stroke-dasharray: 5, 5;
+  transition: all var(--transition);
+}
+
+.isochrone-polygon:hover { fill-opacity: 0.35 !important; stroke-width: 3px !important; }
+
+.leaflet-tooltip.zone-label {
+  background: rgba(11,31,58,0.85) !important; color: white !important;
+  font-weight: 700 !important; font-size: 1rem !important;
+  padding: 8px 14px !important; border-radius: 30px !important;
+  border: 2px solid rgba(255,255,255,0.4) !important;
+  box-shadow: 0 4px 12px rgba(0,0,0,0.4) !important;
+  white-space: nowrap !important; pointer-events: none !important;
+  opacity: 1 !important; display: block !important; visibility: visible !important;
+}
+
+.zone-label-blue { background: rgba(26,75,140,0.9) !important; }
+.zone-label::before, .zone-label::after { display: none !important; }
+
+/* ─── Layout Isochrone ───────────────────────────────────────────────────────*/
+.isochrone-main-layout {
+  display: grid !important;
+  grid-template-columns: 1fr 320px !important;
+  gap: 24px !important; align-items: start !important;
+  width: 100% !important; position: relative !important;
+}
+
+/* ─── Slider ─────────────────────────────────────────────────────────────────*/
+.slider-section {
+  margin-bottom: 30px; padding: 0;
+  background: transparent; position: relative; z-index: 1000;
+}
+
+.slider-card {
+  background: white; border-radius: var(--radius);
+  box-shadow: var(--shadow-card); padding: 20px 24px;
+  border: 1px solid rgba(11,31,58,0.06);
+  z-index: 1100; position: relative;
+}
+
+.slider-container { z-index: 1200 !important; position: relative; }
+
+/* ─── Stat grid générique ────────────────────────────────────────────────────*/
+.stat-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+  gap: 16px; width: 100%;
+}
+
+.stat-pill {
+  background: #fff; border-radius: var(--radius);
+  padding: 18px; box-shadow: var(--shadow-card);
+  border-left: 4px solid var(--bleu-rail);
+}
+
+.stat-pill.green  { border-left-color: var(--vert-nature); }
+.stat-pill.gold   { border-left-color: var(--or-soleil); }
+.stat-pill.blue   { border-left-color: var(--bleu-rail); }
+
+/* ─── Control bar ────────────────────────────────────────────────────────────*/
+.control-bar {
+  display: flex; gap: 32px; align-items: center; flex-wrap: wrap;
+}
+
+/* ════════════════════════════════════════════════════════════════════════════
+   RESPONSIVE
+   ════════════════════════════════════════════════════════════════════════════*/
+@media (max-width: 1200px) {
+  .itin-main-grid {
+    grid-template-columns: 360px 1fr;
+  }
+}
+
+@media (max-width: 1024px) {
+  .itin-main-grid {
+    grid-template-columns: 1fr;
+  }
+
+  .itin-col-right {
+    order: -1; /* carte en premier sur mobile */
+  }
+
+  .itin-config-grid {
+    grid-template-columns: 1fr 1fr;
+  }
+
+  .itin-config-grid > div:last-child {
+    grid-column: 1 / -1;
+  }
+
+  .itin-btn-primary {
+    width: auto;
+    padding: 12px 32px;
+  }
+
+  .isochrone-main-layout {
+    grid-template-columns: 1fr !important;
+  }
+
+  .legend-wrapper {
+    width: 100% !important;
+  }
+}
+
+@media (max-width: 900px) {
+  :root { --sidebar-width: 70px; }
+
+  #sidebar h1, .nav-link span { display: none; }
+
+  .page-body { padding: 20px 16px; }
+
+  .itin-stats-row {
+    grid-template-columns: repeat(2, 1fr);
+  }
+
+  #itin-map-wrapper { height: 360px !important; }
+}
+
+@media (max-width: 640px) {
+  .itin-config-grid { grid-template-columns: 1fr; }
+  .itin-stats-row   { grid-template-columns: repeat(2, 1fr); }
+
+  .page-header { padding: 16px 20px; }
+
+  .map-wrapper, #iso-map, #iso-map .leaflet-container {
+    height: 380px !important; min-height: 380px !important;
+  }
+}
