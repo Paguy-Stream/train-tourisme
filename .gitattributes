@@ -1,3 +1,10 @@
-*.parquet filter=lfs diff=lfs merge=lfs -text
-stop_times.txt filter=lfs diff=lfs merge=lfs -text
+# Créer .gitattributes
+@"
+# Fichiers binaires — ne pas toucher au contenu
+*.parquet binary
+*.pkl     binary
+*.pkl.gz  binary
+*.gz      binary
+*.db      binary
+"@ | Out-File -FilePath .gitattributes -Encoding utf8
 data/raw/amenagements_cyclables.parquet !text !filter !merge !diff
