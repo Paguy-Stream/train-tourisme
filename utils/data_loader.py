@@ -1,5 +1,5 @@
 """
-data_loader.py (v5 — corrections issues du diagnostic)
+data_loader.py (v6 — lazy loading + cache global)
 ────────────────────────────────────────────────────────
 CORRECTIONS vs v4 :
 
@@ -18,6 +18,7 @@ CORRECTIONS vs v4 :
 
 import os
 import json
+import threading
 import pandas as pd
 import numpy as np
 from functools import lru_cache
@@ -32,6 +33,15 @@ GARES_CSV         = os.path.join(RAW_DIR, "gares.csv")
 POI_CSV           = os.path.join(RAW_DIR, "poi.csv")
 POI_PARQUET       = os.path.join(RAW_DIR, "poi.parquet")   # prioritaire si present
 SCORES_CACHE_FILE = os.path.join(PROC_DIR, "scores_eco_gares.json")
+
+
+# ─── Cache global (lazy loading) ────────────────────────────────────────────
+# Les datasets lourds ne sont chargés qu'à la première demande.
+# Thread-safe via Lock pour éviter les doubles chargements en prod.
+_cache_lock        = threading.Lock()
+_cache_cyclables   = None   # ~117 Mo RAM — chargé à la 1ère requête mobilite
+_cache_gares       = None   # ~1 Mo RAM   — chargé au démarrage
+_cache_poi         = None   # ~68 Mo RAM  — chargé au démarrage
 
 
 def _ensure_dirs():
@@ -472,6 +482,10 @@ def get_reachable_gares(df_gares, origin_libelle, max_hours=3.0, avg_speed_kmh=2
 
 
 def load_amenagements_cyclables(bbox=None):
+    """
+    Chargement direct des aménagements cyclables (sans cache).
+    Préférer get_amenagements_cyclables() pour le lazy loading avec cache.
+    """
     path = os.path.join(RAW_DIR, "amenagements_cyclables.parquet")
     if not os.path.exists(path):
         print(f"[data_loader] ⚠️  amenagements_cyclables.parquet introuvable")
@@ -495,6 +509,56 @@ def load_amenagements_cyclables(bbox=None):
     except Exception as e:
         print(f"[data_loader] ❌ Erreur cyclables : {e}")
         return None
+
+
+def get_amenagements_cyclables(bbox=None):
+    """
+    Lazy loading thread-safe des aménagements cyclables.
+
+    Appelé uniquement par mobilite.py à la première interaction utilisateur.
+    Les 117 Mo de RAM ne sont alloués qu'à ce moment — pas au démarrage.
+
+    Économie au démarrage : ~117 Mo RAM (58 Mo parquet × facteur 2.0)
+    """
+    global _cache_cyclables
+    if _cache_cyclables is not None:
+        return _cache_cyclables
+    with _cache_lock:
+        # Double-check après acquisition du lock (évite double chargement)
+        if _cache_cyclables is None:
+            print("[data_loader] 🔄 Chargement aménagements cyclables (lazy)...")
+            _cache_cyclables = load_amenagements_cyclables(bbox)
+            if _cache_cyclables is not None:
+                print(f"[data_loader] ✅ Cyclables en cache ({len(_cache_cyclables):,} segments)")
+            else:
+                print("[data_loader] ⚠️  Cyclables non disponibles")
+    return _cache_cyclables
+
+
+def get_gares() -> pd.DataFrame:
+    """
+    Retourne les gares depuis le cache global.
+    Charge au premier appel, retourne le cache ensuite.
+    """
+    global _cache_gares
+    if _cache_gares is None:
+        with _cache_lock:
+            if _cache_gares is None:
+                _cache_gares = load_gares()
+    return _cache_gares
+
+
+def get_poi() -> pd.DataFrame:
+    """
+    Retourne les POIs depuis le cache global.
+    Charge au premier appel, retourne le cache ensuite.
+    """
+    global _cache_poi
+    if _cache_poi is None:
+        with _cache_lock:
+            if _cache_poi is None:
+                _cache_poi = load_poi()
+    return _cache_poi
 
 
 def load_epv() -> pd.DataFrame:

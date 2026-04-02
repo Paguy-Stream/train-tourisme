@@ -44,7 +44,7 @@ from enum import Enum
 import sys
 
 from utils.mairies_geocoder import get_distance_to_centre
-from utils.data_loader import load_gares, load_amenagements_cyclables, load_poi
+from utils.data_loader import load_gares, load_poi, get_amenagements_cyclables
 from utils.data_loader import compute_distance_km, filter_poi_by_bbox
 
 from gbfs_unified import GBFSClient, GBFSDashboardAdapter, Station
@@ -753,7 +753,7 @@ def get_trends_analyzer():
 if TRENDS_AVAILABLE:
     threading.Thread(target=get_trends_analyzer, daemon=True).start()
 
-_cyclables_cache = _gares_cache = _poi_cache = None
+_gares_cache = _poi_cache = None
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # CHARGEMENT DONNÉES STATIQUES
@@ -772,10 +772,9 @@ def get_poi():
     return _poi_cache
 
 def get_cyclables():
-    global _cyclables_cache
-    if _cyclables_cache is None:
-        _cyclables_cache = load_amenagements_cyclables()
-    return _cyclables_cache
+    # Délègue au lazy loader thread-safe de data_loader (v6)
+    # Les 117 Mo RAM ne sont alloués qu'à la 1ère interaction utilisateur
+    return get_amenagements_cyclables()
 
 df_gares    = get_gares()
 df_poi      = get_poi()
