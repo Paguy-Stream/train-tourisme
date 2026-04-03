@@ -30,6 +30,7 @@ import json
 import zlib
 import warnings
 import hashlib
+import os
 import threading
 import atexit
 import unicodedata
@@ -750,8 +751,13 @@ def get_trends_analyzer():
         atexit.register(lambda: _trends_analyzer.stop_collector() if _trends_analyzer else None)
     return _trends_analyzer
 
-if TRENDS_AVAILABLE:
+# Désactiver le collecteur GBFS en prod si RAM insuffisante
+# Configurer DISABLE_GBFS_COLLECTOR=true dans Railway Variables
+_disable_collector = os.environ.get("DISABLE_GBFS_COLLECTOR", "").lower() in ("1", "true", "yes")
+if TRENDS_AVAILABLE and not _disable_collector:
     threading.Thread(target=get_trends_analyzer, daemon=True).start()
+elif _disable_collector:
+    print("[mobilite] ⚡ Collecteur GBFS désactivé (DISABLE_GBFS_COLLECTOR=true)")
 
 _gares_cache = _poi_cache = None
 
