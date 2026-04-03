@@ -107,6 +107,14 @@ def is_cache_valid(expected_hash=None):
         print(f"[cache] ⚠️  Erreur vérification âge : {e}")
         return False
     
+    # ── FORCE_CACHE : contourne la vérification hash en production ────────────
+    # Utile sur Railway/Render où stop_times.txt vient de Git LFS
+    # et peut avoir un hash différent du cache local.
+    if os.environ.get("FORCE_CACHE", "").lower() in ("1", "true", "yes"):
+        print("[cache] 🔒 FORCE_CACHE activé — hash ignoré")
+        print(f"[cache] ✅ Cache valide ({age_hours:.1f}h)")
+        return True
+
     # ── Vérifier hash si fourni ───────────────────────────────────────────────
     if expected_hash and HASH_CACHE_FILE.exists():
         try:
