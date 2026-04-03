@@ -2,5 +2,6 @@
 *.pkl binary
 *.pkl.gz binary
 *.gz binary
-*.db binary
+*.db binary*.txt binary
+*.csv binary
 data/raw/amenagements_cyclables.parquet !text !filter !merge !diff
