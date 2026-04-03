@@ -2,6 +2,8 @@
 *.pkl binary
 *.pkl.gz binary
 *.gz binary
-*.db binary*.txt binary
+*.db binary
+*.txt binary
 *.csv binary
+data/raw/Export_OpenData_SNCF_GTFS/stop_times.txt filter=lfs diff=lfs merge=lfs -text
 data/raw/amenagements_cyclables.parquet !text !filter !merge !diff
