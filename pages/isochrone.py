@@ -450,21 +450,40 @@ gare_options = [{"label": g, "value": g}
 spatial_index  = None
 poi_geometries = []
 
-try:
-    df_poi = load_poi()
-    df_poi = df_poi[
-        pd.notna(df_poi['latitude']) & pd.notna(df_poi['longitude'])
-    ].copy()
-    print(f"[isochrone] 📍 Construction R-tree sur {len(df_poi)} POI...")
-    poi_geometries = [Point(row['longitude'], row['latitude'])
-                      for _, row in df_poi.iterrows()]
-    spatial_index  = STRtree(poi_geometries)
-    print("[isochrone] ✅ R-tree construit !")
-    POI_LOADED = True
-except Exception as e:
-    print(f"[isochrone] ⚠️  POI non chargés : {e}")
-    df_poi     = pd.DataFrame()
-    POI_LOADED = False
+# ── POI + R-tree : lazy loading ─────────────────────────────────────────
+# Ne pas construire le R-tree au démarrage — trop coûteux en RAM (pic ~200 Mo).
+# Construit à la première requête isochrone via _get_poi_index().
+_poi_index_cache = None
+_poi_geometries_cache = []
+_df_poi_cache = None
+POI_LOADED = False
+
+def _get_poi_index():
+    """Lazy loader thread-safe pour le R-tree POI."""
+    global _poi_index_cache, _poi_geometries_cache, _df_poi_cache, POI_LOADED
+    if _poi_index_cache is not None:
+        return _df_poi_cache, _poi_geometries_cache, _poi_index_cache
+    try:
+        df = load_poi()
+        df = df[pd.notna(df['latitude']) & pd.notna(df['longitude'])].copy()
+        print(f"[isochrone] 📍 Construction R-tree sur {len(df)} POI...")
+        geoms = [Point(row['longitude'], row['latitude'])
+                 for _, row in df.iterrows()]
+        idx = STRtree(geoms)
+        _df_poi_cache = df
+        _poi_geometries_cache = geoms
+        _poi_index_cache = idx
+        POI_LOADED = True
+        print("[isochrone] ✅ R-tree construit !")
+    except Exception as e:
+        print(f"[isochrone] ⚠️  POI non chargés : {e}")
+        _df_poi_cache = pd.DataFrame()
+    return _df_poi_cache, _poi_geometries_cache, _poi_index_cache
+
+# Variables globales initialisées vides — remplies au premier appel
+df_poi = pd.DataFrame()
+poi_geometries = []
+spatial_index = None
 
 try:
     df_stops_gtfs = load_gtfs_stops()
@@ -1092,6 +1111,8 @@ def update_isochrone(gare1, gare2, max_hours, train_types):
             ],
         ))
 
+    if poly1:
+        df_poi, poi_geometries, spatial_index = _get_poi_index()
     if POI_LOADED and poly1:
         poi_count, _ = count_poi_in_zone_optimized(
             poly1, spatial_index, poi_geometries, df_poi)
@@ -1108,6 +1129,8 @@ def update_isochrone(gare1, gare2, max_hours, train_types):
     top_widget = html.Div()
     top_gares  = []
 
+    if POI_LOADED or True:  # lazy — chargé au premier appel
+        df_poi, poi_geometries, spatial_index = _get_poi_index()
     if POI_LOADED:
         max_t     = max_hours * 60
         top_gares = get_top_destinations(
