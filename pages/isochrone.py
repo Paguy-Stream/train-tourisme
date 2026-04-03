@@ -486,18 +486,50 @@ poi_geometries = []
 spatial_index = None
 
 try:
-    df_stops_gtfs = load_gtfs_stops()
-    df_stop_times = load_gtfs_stop_times()
-    df_trips      = load_gtfs_trips()
-    from utils.rail_graph import get_rail_graph
-    G_RAIL = get_rail_graph(
-        df_stops=df_stops_gtfs,
-        df_stop_times=df_stop_times,
-        df_trips=df_trips,
-        sample_rate=0.5,
-    )
-    GRAPH_LOADED = True
-    print(f"[isochrone] ✅ Graphe : {len(G_RAIL.nodes)} nœuds")
+    from utils.rail_cache import is_cache_valid, load_rail_graph
+    import os
+
+    # Stratégie Railway : FORCE_CACHE ou cache pkl valide → skip reconstruction
+    # stop_times.txt en LFS peut arriver tronqué (2 lignes) sur Railway
+    force_cache = os.environ.get("FORCE_CACHE", "").lower() in ("1", "true", "yes")
+
+    if force_cache or is_cache_valid():
+        if force_cache:
+            print("[isochrone] 🔒 FORCE_CACHE — chargement depuis cache pkl")
+        G_cache, _ = load_rail_graph()
+        if G_cache is not None:
+            G_RAIL = G_cache
+            GRAPH_LOADED = True
+            df_stops_gtfs = load_gtfs_stops()
+            print(f"[isochrone] ✅ Graphe : {len(G_RAIL.nodes)} nœuds")
+        else:
+            raise Exception("Cache pkl vide")
+    else:
+        df_stops_gtfs = load_gtfs_stops()
+        df_stop_times = load_gtfs_stop_times()
+        df_trips      = load_gtfs_trips()
+
+        # Sécurité : si stop_times tronqué (LFS non résolu), utiliser le cache
+        if len(df_stop_times) < 1000:
+            print(f"[isochrone] ⚠️  stop_times tronqué ({len(df_stop_times)} lignes) → fallback cache")
+            G_cache, _ = load_rail_graph()
+            if G_cache is not None:
+                G_RAIL = G_cache
+                GRAPH_LOADED = True
+                print(f"[isochrone] ✅ Graphe depuis cache : {len(G_RAIL.nodes)} nœuds")
+            else:
+                raise Exception("stop_times tronqué et cache introuvable")
+        else:
+            from utils.rail_graph import get_rail_graph
+            G_RAIL = get_rail_graph(
+                df_stops=df_stops_gtfs,
+                df_stop_times=df_stop_times,
+                df_trips=df_trips,
+                sample_rate=0.5,
+            )
+            GRAPH_LOADED = True
+            print(f"[isochrone] ✅ Graphe reconstruit : {len(G_RAIL.nodes)} nœuds")
+
 except Exception as e:
     print(f"[isochrone] ❌ Erreur graphe : {e}")
     GRAPH_LOADED = False
