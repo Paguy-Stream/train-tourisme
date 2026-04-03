@@ -23,7 +23,7 @@ import numpy as np
 from shapely.geometry import Point
 from shapely.strtree import STRtree
 
-from utils.data_loader import load_gares, load_poi
+from utils.data_loader import load_gares, load_poi, get_poi
 from utils.rail_graph import get_reachable_stops_by_time_brackets
 from utils.realtime_trains import (
     load_gtfs_stops,
@@ -464,7 +464,7 @@ def _get_poi_index():
     if _poi_index_cache is not None:
         return _df_poi_cache, _poi_geometries_cache, _poi_index_cache
     try:
-        df = load_poi()
+        df = get_poi()
         df = df[pd.notna(df['latitude']) & pd.notna(df['longitude'])].copy()
         print(f"[isochrone] 📍 Construction R-tree sur {len(df)} POI...")
         geoms = [Point(row['longitude'], row['latitude'])

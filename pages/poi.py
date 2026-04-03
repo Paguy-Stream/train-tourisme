@@ -19,9 +19,9 @@ import pandas as pd
 import time
 
 from utils.data_loader import (
-    load_gares, 
-    load_poi, 
-    load_epv,  # NOUVEAU : EPV
+    load_gares,
+    get_poi,    # cache global — évite double chargement en RAM
+    load_epv,
     compute_distance_km_cached,
     filter_poi_by_bbox,
     compute_eco_accessibility_score,
@@ -31,9 +31,10 @@ from utils.data_loader import (
 dash.register_page(__name__, path="/poi", name="Points d'intérêt")
 
 # ─── Chargement données ───────────────────────────────────────────────────────
+# get_poi() retourne le cache global partagé — pas de double chargement en RAM
 df_gares = load_gares()
-df_poi_datatourisme = load_poi()
-df_epv = load_epv()  # NOUVEAU : Entreprises Patrimoine Vivant
+df_poi_datatourisme = get_poi()
+df_epv = load_epv()
 
 # Fusionner POI DATAtourisme + EPV
 df_poi = pd.concat([df_poi_datatourisme, df_epv], ignore_index=True)

@@ -44,7 +44,7 @@ from enum import Enum
 import sys
 
 from utils.mairies_geocoder import get_distance_to_centre
-from utils.data_loader import load_gares, load_poi, get_amenagements_cyclables
+from utils.data_loader import load_gares, load_poi, get_poi, get_amenagements_cyclables
 from utils.data_loader import compute_distance_km, filter_poi_by_bbox
 
 from gbfs_unified import GBFSClient, GBFSDashboardAdapter, Station
@@ -765,11 +765,9 @@ def get_gares():
         _gares_cache = load_gares()
     return _gares_cache
 
-def get_poi():
-    global _poi_cache
-    if _poi_cache is None:
-        _poi_cache = load_poi()
-    return _poi_cache
+def get_poi_local():
+    # Délègue au cache global data_loader
+    return get_poi_local()
 
 def get_cyclables():
     # Délègue au lazy loader thread-safe de data_loader (v6)
@@ -777,7 +775,7 @@ def get_cyclables():
     return get_amenagements_cyclables()
 
 df_gares    = get_gares()
-df_poi      = get_poi()
+df_poi      = get_poi_local()
 gare_options = [{"label": g, "value": g} for g in sorted(df_gares["libelle"].tolist())]
 
 # ═══════════════════════════════════════════════════════════════════════════════
