@@ -467,8 +467,16 @@ def _get_poi_index():
         df = get_poi()
         df = df[pd.notna(df['latitude']) & pd.notna(df['longitude'])].copy()
         print(f"[isochrone] 📍 Construction R-tree sur {len(df)} POI...")
-        geoms = [Point(row['longitude'], row['latitude'])
-                 for _, row in df.iterrows()]
+        import numpy as np
+        # numpy vectorisé : ~2s au lieu de ~20s avec iterrows
+        lons = df['longitude'].to_numpy(dtype=float)
+        lats = df['latitude'].to_numpy(dtype=float)
+        from shapely import points as shapely_points
+        try:
+            # shapely >= 2.0 : vectorisé ultra-rapide
+            geoms = list(shapely_points(lons, lats))
+        except Exception:
+            geoms = [Point(lo, la) for lo, la in zip(lons, lats)]
         idx = STRtree(geoms)
         _df_poi_cache = df
         _poi_geometries_cache = geoms
