@@ -5,13 +5,13 @@ Page d'accueil du tableau de bord Tourisme en Train.
 """
 import dash
 from dash import html
-from utils.data_loader import load_gares, load_poi, load_epv
+from utils.data_loader import load_gares, get_poi, load_epv
 
 dash.register_page(__name__, path="/", name="Accueil")
 
 # ─── Chargement données ───────────────────────────────────────────────────────
 df_gares = load_gares()
-df_poi   = load_poi()
+df_poi   = get_poi()
 df_epv   = load_epv()
 
 # Calculer total POI (DATAtourisme + EPV)

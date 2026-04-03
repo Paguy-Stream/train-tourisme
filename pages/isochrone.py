@@ -23,7 +23,7 @@ import numpy as np
 from shapely.geometry import Point
 from shapely.strtree import STRtree
 
-from utils.data_loader import load_gares, load_poi, get_poi
+from utils.data_loader import load_gares, get_poi, get_poi
 from utils.rail_graph import get_reachable_stops_by_time_brackets
 from utils.realtime_trains import (
     load_gtfs_stops,

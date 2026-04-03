@@ -20,13 +20,13 @@ import dash
 from dash import dcc, html, Input, Output, callback, State, ctx
 import dash_leaflet as dl
 
-from utils.data_loader import load_gares, load_poi
+from utils.data_loader import load_gares, get_poi
 from utils.route_optimizer import generate_optimized_route, THEMES_CONFIG
 
 dash.register_page(__name__, path="/itineraires", name="Itinéraires")
 
 df_gares = load_gares()
-df_poi   = load_poi()
+df_poi   = get_poi()  # cache global partage
 COLORS   = ["#2D6A4F", "#1A4B8C", "#F4A620", "#9333EA", "#E85D04"]
 
 # ─── Mapping département → région ─────────────────────────────────────────────
