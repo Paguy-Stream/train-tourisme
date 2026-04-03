@@ -767,7 +767,7 @@ def get_gares():
 
 def get_poi_local():
     # Délègue au cache global data_loader
-    return get_poi_local()
+    return get_poi()
 
 def get_cyclables():
     # Délègue au lazy loader thread-safe de data_loader (v6)
