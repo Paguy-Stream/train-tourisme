@@ -145,6 +145,8 @@ class POICandidate:
     distance_gare: float
     score: float = 0.0
     cluster_id: int = -1
+    sous_type: str = ""       # Ex: "Site culturel", "Fournisseur de dégustation"
+    site_internet: str = ""   # URL officielle du site touristique
 
     def to_dict(self):
         return {
@@ -152,6 +154,8 @@ class POICandidate:
             "lat": round(self.latitude, 6), "lon": round(self.longitude, 6),
             "commune": self.commune, "dist": round(self.distance_gare, 2),
             "score": round(self.score, 3),
+            "sous_type": self.sous_type,
+            "site_internet": self.site_internet,
         }
 
 @dataclass
@@ -497,7 +501,9 @@ def select_best_poi_per_cluster(df_poi, target_count, seed=None):
                 latitude=float(row['latitude']), longitude=float(row['longitude']),
                 commune=str(row.get('commune', 'Inconnue')),
                 distance_gare=float(row['distance_gare']),
-                score=float(row['theme_score']), cluster_id=-1))
+                score=float(row['theme_score']), cluster_id=-1,
+                sous_type=str(row.get('sous_type', '') or ''),
+                site_internet=str(row.get('site_internet', '') or '')))
         return selected[:target_count]
     total = len(df_poi[df_poi['cluster_id'] != -1])
     remaining = target_count
@@ -521,7 +527,9 @@ def select_best_poi_per_cluster(df_poi, target_count, seed=None):
                 latitude=float(best['latitude']), longitude=float(best['longitude']),
                 commune=str(best.get('commune', 'Inconnue')),
                 distance_gare=float(best['distance_gare']),
-                score=float(best['_final_score']), cluster_id=int(cluster_id)))
+                score=float(best['_final_score']), cluster_id=int(cluster_id),
+                sous_type=str(best.get('sous_type', '') or ''),
+                site_internet=str(best.get('site_internet', '') or '')))
         remaining -= quota
     if remaining > 0:
         outliers = df_poi[df_poi['cluster_id'] == -1]
@@ -536,7 +544,9 @@ def select_best_poi_per_cluster(df_poi, target_count, seed=None):
                     latitude=float(best['latitude']), longitude=float(best['longitude']),
                     commune=str(best.get('commune', 'Inconnue')),
                     distance_gare=float(best['distance_gare']),
-                    score=float(score), cluster_id=-1))
+                    score=float(score), cluster_id=-1,
+                    sous_type=str(best.get('sous_type', '') or ''),
+                    site_internet=str(best.get('site_internet', '') or '')))
     selected.sort(key=lambda p: p.score, reverse=True)
     return selected[:target_count]
 

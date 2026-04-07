@@ -231,7 +231,8 @@ def load_poi() -> pd.DataFrame:
             for col in df.columns:
                 col_lower = col.lower()
                 if col_lower in ('latitude', 'longitude', 'nom', 'type',
-                                 'commune', 'sous-type', 'code postal'):
+                                 'commune', 'sous-type', 'code postal',
+                                 'site internet', 'est_officiel'):
                     rename_map[col] = col_lower.replace('-', '_').replace(' ', '_')
             if rename_map:
                 df = df.rename(columns=rename_map)
@@ -269,6 +270,7 @@ def load_poi() -> pd.DataFrame:
         "Code postal":  "code_postal",
         "Latitude":     "latitude",
         "Longitude":    "longitude",
+        "Site internet": "site_internet",
     })
 
     df["latitude"]  = pd.to_numeric(df["latitude"],  errors="coerce")

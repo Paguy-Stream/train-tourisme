@@ -541,6 +541,12 @@ def _build_steps_detail(route):
                 html.H4(step.poi.nom,
                         style={"margin": "0 0 6px", "fontSize": "0.95rem",
                                "color": "#111827"}),
+                # Sous-type DATAtourisme — informe sur la nature du site
+                html.P(
+                    getattr(step.poi, 'sous_type', None) or '',
+                    style={"margin": "0 0 4px", "fontSize": "0.78rem",
+                           "color": "#6B7280", "fontStyle": "italic"}
+                ) if getattr(step.poi, 'sous_type', None) else html.Span(),
                 html.Div(style={"display": "flex", "gap": "6px", "flexWrap": "wrap"},
                          children=[
                     html.Span(f"📍 {step.poi.commune}", className="badge badge-green"),
@@ -548,6 +554,17 @@ def _build_steps_detail(route):
                     html.Span(f"🚶 {step.distance_from_previous:.1f} km",
                               className="badge badge-blue"),
                 ]),
+                # Lien vers le site officiel si disponible
+                html.A(
+                    "🔗 En savoir plus",
+                    href=getattr(step.poi, 'site_internet', None),
+                    target="_blank",
+                    style={"fontSize": "0.78rem", "color": "#3B82F6",
+                           "textDecoration": "none", "marginTop": "4px",
+                           "display": "inline-block"}
+                ) if getattr(step.poi, 'site_internet', None) and
+                     str(getattr(step.poi, 'site_internet', '') or '').startswith('http')
+                  else html.Span(),
             ]),
         ]))
     return html.Div(className="card", style={"padding": "20px"}, children=[
