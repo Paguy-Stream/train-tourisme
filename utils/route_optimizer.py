@@ -267,6 +267,32 @@ def normalize_columns(df):
 # Cache global des fréquences de noms — calculé une seule fois sur toute la base
 _nom_counts_global = None
 
+# Cache global des URLs — chargé depuis poi_urls.parquet
+_poi_urls_cache = None
+
+def _get_poi_urls():
+    """
+    Retourne un dict {nom: site_internet} depuis poi_urls.parquet.
+    Chargé une seule fois, ~15 Mo disque, non conservé en RAM globale.
+    Uniquement pour enrichir les étapes des itinéraires.
+    """
+    global _poi_urls_cache
+    if _poi_urls_cache is not None:
+        return _poi_urls_cache
+    try:
+        import pandas as pd
+        path = 'data/raw/poi_urls.parquet'
+        df_urls = pd.read_parquet(path)
+        # Dict nom → première URL non-nulle trouvée
+        df_urls = df_urls[df_urls['site_internet'].notna() &
+                          df_urls['site_internet'].str.startswith('http', na=False)]
+        _poi_urls_cache = dict(zip(df_urls['nom'], df_urls['site_internet']))
+        print(f"[route_optimizer] 🔗 {len(_poi_urls_cache):,} URLs chargées")
+    except Exception as e:
+        print(f"[route_optimizer] ⚠️  URLs non disponibles : {e}")
+        _poi_urls_cache = {}
+    return _poi_urls_cache
+
 def _get_nom_counts_global(df_global):
     """
     Calcule les fréquences de noms sur toute la base DATAtourisme (486K POIs).
@@ -496,6 +522,7 @@ def select_best_poi_per_cluster(df_poi, target_count, seed=None):
         for idx, row in df_top.iterrows():
             poi_id = safe_convert_to_int(idx)
             if poi_id <= 0: poi_id = abs(hash(str(row['nom']))) % 1000000
+            _urls = _get_poi_urls()
             selected.append(POICandidate(
                 id=poi_id, nom=str(row['nom']), type=str(row.get('type', 'Lieu')),
                 latitude=float(row['latitude']), longitude=float(row['longitude']),
@@ -503,7 +530,7 @@ def select_best_poi_per_cluster(df_poi, target_count, seed=None):
                 distance_gare=float(row['distance_gare']),
                 score=float(row['theme_score']), cluster_id=-1,
                 sous_type=str(row.get('sous_type', '') or ''),
-                site_internet=str(row.get('site_internet', '') or '')))
+                site_internet=_urls.get(str(row['nom']), '')))
         return selected[:target_count]
     total = len(df_poi[df_poi['cluster_id'] != -1])
     remaining = target_count
@@ -522,6 +549,7 @@ def select_best_poi_per_cluster(df_poi, target_count, seed=None):
         for idx, best in group.nlargest(quota, '_final_score').iterrows():
             poi_id = safe_convert_to_int(idx)
             if poi_id <= 0: poi_id = abs(hash(str(best['nom']))) % 1000000
+            _urls = _get_poi_urls()
             selected.append(POICandidate(
                 id=poi_id, nom=str(best['nom']), type=str(best.get('type', 'Lieu')),
                 latitude=float(best['latitude']), longitude=float(best['longitude']),
@@ -529,7 +557,7 @@ def select_best_poi_per_cluster(df_poi, target_count, seed=None):
                 distance_gare=float(best['distance_gare']),
                 score=float(best['_final_score']), cluster_id=int(cluster_id),
                 sous_type=str(best.get('sous_type', '') or ''),
-                site_internet=str(best.get('site_internet', '') or '')))
+                site_internet=_urls.get(str(best['nom']), '')))
         remaining -= quota
     if remaining > 0:
         outliers = df_poi[df_poi['cluster_id'] == -1]
@@ -539,6 +567,7 @@ def select_best_poi_per_cluster(df_poi, target_count, seed=None):
                 if poi_id <= 0: poi_id = abs(hash(str(best['nom']))) % 1000000
                 prox_score = 1.0 - (best['distance_gare'] / max_dist)
                 score = (0.4 * best['theme_score'] + 0.3 * prox_score + 0.15) * 0.8
+                _urls = _get_poi_urls()
                 selected.append(POICandidate(
                     id=poi_id, nom=str(best['nom']), type=str(best.get('type', 'Lieu')),
                     latitude=float(best['latitude']), longitude=float(best['longitude']),
@@ -546,7 +575,7 @@ def select_best_poi_per_cluster(df_poi, target_count, seed=None):
                     distance_gare=float(best['distance_gare']),
                     score=float(score), cluster_id=-1,
                     sous_type=str(best.get('sous_type', '') or ''),
-                    site_internet=str(best.get('site_internet', '') or '')))
+                    site_internet=_urls.get(str(best['nom']), '')))
     selected.sort(key=lambda p: p.score, reverse=True)
     return selected[:target_count]
 
