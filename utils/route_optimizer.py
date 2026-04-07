@@ -257,6 +257,12 @@ def normalize_columns(df):
     for old, new in mapping.items():
         if old in df.columns and new not in df.columns:
             df.rename(columns={old: new}, inplace=True)
+    # Convertir les colonnes category en string pour éviter
+    # "Cannot setitem on a Categorical with a new category"
+    for col in df.columns:
+        if hasattr(df[col], 'cat'):
+            df[col] = df[col].astype(str)
+
     if 'type'        not in df.columns: df['type']        = 'Lieu'
     if 'commune'     not in df.columns: df['commune']     = 'Inconnue'
     if 'description' not in df.columns: df['description'] = ''

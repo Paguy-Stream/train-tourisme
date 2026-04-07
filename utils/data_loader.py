@@ -239,6 +239,12 @@ def load_poi() -> pd.DataFrame:
             df['latitude']  = pd.to_numeric(df['latitude'],  errors='coerce')
             df['longitude'] = pd.to_numeric(df['longitude'], errors='coerce')
             df = df.dropna(subset=['latitude', 'longitude'])
+            # Convertir les colonnes category en string
+            # Évite "Cannot setitem on a Categorical with a new category"
+            # lors des fillna('') et str.contains() dans route_optimizer et isochrone
+            for col in df.columns:
+                if hasattr(df[col], 'cat'):
+                    df[col] = df[col].astype(str).replace('nan', '')
             print(f"[data_loader] ✅ {len(df):,} POI DATAtourisme chargés (parquet)")
             return df.reset_index(drop=True)
         except Exception as e:
