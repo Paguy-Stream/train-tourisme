@@ -37,45 +37,91 @@ CONFIG = {
 }
 
 THEMES_CONFIG = {
-    "romantique": {
-        "emoji": "💕",
-        "label": "Weekend Romantique",
-        "description": "Châteaux, restaurants raffinés, sites romantiques",
-        "keywords": ["château", "castle", "palais", "jardin", "restaurant", "spa", "vignoble", "wine", "gastronomie", "monument", "romantique", "loire", "renaissance", "parc", "hôtel"],
-        "poi_per_day": 3,
-        "budget_multiplicateur": 1.5,  # châteaux + restaurants gastronomiques
+    "culture": {
+        "emoji": "🎭",
+        "label": "Culture & Patrimoine",
+        "description": "Musées, châteaux, monuments historiques",
+        # Sous-types cibles : Site culturel (44 785), Visite (4 234)
+        "keywords": ["musée", "museum", "monument", "cathédrale", "patrimoine",
+                     "heritage", "historique", "théâtre", "architecture",
+                     "abbaye", "château", "exposition", "art", "galerie",
+                     "chapelle", "beffroi", "ruine", "archéologie",
+                     "site culturel", "mémorial", "maison natale"],
+        "sous_types_bonus": ["site culturel", "visite"],
+        "poi_per_day": 5,
+        "budget_multiplicateur": 1.0,
     },
     "nature": {
         "emoji": "🌿",
-        "label": "Aventure Verte",
-        "description": "Voies vertes, sites naturels, hébergements éco",
-        "keywords": ["parc", "park", "nature", "lac", "lake", "montagne", "forêt", "forest", "rivière", "randonnée", "trail", "vélo", "bike", "écologique", "green", "jardin", "botanical", "zoo", "animal", "faune", "flore"],
+        "label": "Nature & Randonnée",
+        "description": "Sites naturels, itinéraires pédestres et cyclables",
+        # Sous-types cibles : Site naturel (5 611), Itinéraire pédestre (10 832),
+        #                     Itinéraire cyclable (3 809)
+        "keywords": ["nature", "lac", "montagne", "forêt", "rivière",
+                     "randonnée", "trail", "vélo", "bike", "écologique",
+                     "jardin", "botanique", "faune", "flore", "parc naturel",
+                     "réserve", "sentier", "gorges", "cascade", "falaise",
+                     "itinéraire", "voie verte", "pédestre", "cyclable"],
+        "sous_types_bonus": ["site naturel", "itinéraire pédestre",
+                             "itinéraire cyclable"],
         "poi_per_day": 4,
-        "budget_multiplicateur": 0.6,  # souvent gratuit (plein air, parcs)
+        "budget_multiplicateur": 0.5,
     },
-    "culture": {
-        "emoji": "🎭",
-        "label": "Culture & Train",
-        "description": "Musées, monuments historiques, patrimoine",
-        "keywords": ["musée", "museum", "monument", "cathédrale", "église", "patrimoine", "heritage", "historique", "théâtre", "architecture", "abbaye", "château", "exposition", "culture", "art", "galerie", "tour", "chapelle", "beffroi", "ruine", "archéologie"],
-        "poi_per_day": 5,
-        "budget_multiplicateur": 1.0,  # entrées musées standard
+    "gastronomie": {
+        "emoji": "🍷",
+        "label": "Route des Saveurs",
+        "description": "Vignobles, caves, producteurs locaux et marchés",
+        # Sous-types cibles : Fournisseur de dégustation (14 232),
+        #                     Evènement commercial (7 500)
+        "keywords": ["vignoble", "cave", "dégustation", "domaine", "château",
+                     "terroir", "fromage", "producteur", "ferme", "cidre",
+                     "brasserie", "distillerie", "marché", "saveur", "gastronomie",
+                     "gourmet", "artisan", "huile", "miel", "confiture",
+                     "fournisseur"],
+        "sous_types_bonus": ["fournisseur de dégustation"],
+        "poi_per_day": 4,
+        "budget_multiplicateur": 1.3,
     },
     "famille": {
         "emoji": "👨‍👩‍👧‍👦",
         "label": "Escapade Famille",
         "description": "Parcs d'attractions, zoos, activités enfants",
-        "keywords": ["parc", "zoo", "aquarium", "attraction", "enfant", "famille", "family", "jeu", "game", "loisir", "ferme", "farm", "animaux", "plage", "beach", "parc d'attraction", "manège", "piscine", "sport"],
+        # Sous-types cibles : Site sportif récréatif (33 568)
+        "keywords": ["zoo", "aquarium", "attraction", "enfant", "famille",
+                     "loisir", "ferme", "animaux", "plage", "manège",
+                     "disneyland", "disney", "parc d'attraction",
+                     "parc de loisirs", "île de loisirs", "aventure",
+                     "accrobranche", "laser", "karting enfant"],
+        "sous_types_bonus": ["site sportif, récréatif et de loisirs"],
         "poi_per_day": 3,
-        "budget_multiplicateur": 1.8,  # parcs d'attractions onéreux (30-50€/pers)
+        "budget_multiplicateur": 1.8,
     },
-    "gastronomie": {
-        "emoji": "🍷",
-        "label": "Route des Saveurs",
-        "description": "Restaurants, vignobles, marchés locaux",
-        "keywords": ["restaurant", "vignoble", "wine", "cave", "dégustation", "gastronomie", "marché", "market", "terroir", "fromage", "cheese", "local", "producteur", "bistrot", "cuisine", "gourmet", "brasserie"],
+    "romantique": {
+        "emoji": "💕",
+        "label": "Weekend Romantique",
+        "description": "Châteaux, jardins, sites classés et villages de charme",
+        # Sous-types cibles : Site culturel (44 785) + filtrage par keywords doux
+        "keywords": ["château", "palais", "jardin", "romantique", "renaissance",
+                     "village", "vignoble", "abbaye", "cloître", "thermes",
+                     "spa", "panorama", "belvédère", "promenade",
+                     "patrimoine mondial", "classé", "remarquable"],
+        "sous_types_bonus": ["site culturel", "site naturel"],
+        "poi_per_day": 3,
+        "budget_multiplicateur": 1.5,
+    },
+    "festivals": {
+        "emoji": "🎪",
+        "label": "Fêtes & Festivals",
+        "description": "Festivals, fêtes locales, marchés de Noël, spectacles",
+        # Sous-types cibles : Évènement culturel (29 010),
+        #                     Fête et manifestation (76 143)
+        "keywords": ["festival", "fête", "spectacle", "concert", "marché de noël",
+                     "foire", "carnaval", "exposition", "salon", "animation",
+                     "événement", "manifestation", "célébration", "braderie",
+                     "brocante", "vide-grenier", "parade"],
+        "sous_types_bonus": ["évènement culturel", "évènement culturel,évènement sports et loisirs"],
         "poi_per_day": 4,
-        "budget_multiplicateur": 1.4,  # dégustations + repas gastronomiques
+        "budget_multiplicateur": 0.8,
     },
 }
 
@@ -214,18 +260,178 @@ def normalize_columns(df):
     df['longitude'] = pd.to_numeric(df['longitude'], errors='coerce')
     return df.dropna(subset=['latitude', 'longitude'])
 
-def compute_theme_scores(df, theme):
+# Cache global des fréquences de noms — calculé une seule fois sur toute la base
+_nom_counts_global = None
+
+def _get_nom_counts_global(df_global):
+    """
+    Calcule les fréquences de noms sur toute la base DATAtourisme (486K POIs).
+    Proxy de notoriété objectif : le Louvre, Disneyland, Versailles apparaissent
+    souvent car ils ont beaucoup d'événements/services associés dans la base.
+    Résultat mis en cache pour ne calculer qu'une seule fois.
+    """
+    global _nom_counts_global
+    if _nom_counts_global is None:
+        _nom_counts_global = df_global['nom'].value_counts()
+        print(f"[route_optimizer] 📊 Notoriété calculée sur {len(df_global):,} POIs")
+    return _nom_counts_global
+
+
+def compute_theme_scores(df, theme, df_global=None):
     cache_key = (theme, id(df))
     if cache_key in _theme_scores:
         return _theme_scores[cache_key]
     config = THEMES_CONFIG[theme]
     text = (df['nom'].fillna('') + ' ' + df['type'].fillna('') + ' ' +
-            df.get('description', pd.Series(['']*len(df))).fillna('')).str.lower()
+        df.get('sous_type', pd.Series(['']*len(df))).fillna('') + ' ' +
+        df.get('description', pd.Series(['']*len(df))).fillna('')).str.lower()
     scores = np.zeros(len(df))
     for kw in config['keywords']:
         scores += text.str.contains(kw.lower(), regex=False, na=False).astype(float) * 0.15
     scores = np.clip(scores, 0.0, 1.0)
     scores = np.maximum(scores, 0.05)
+
+    # ── Bonus sous_type cible du thème ───────────────────────────────────────
+    # Chaque thème définit ses sous_types DATAtourisme prioritaires.
+    # Un POI dont le sous_type correspond exactement au thème reçoit un bonus.
+    # Ex: gastronomie → "Fournisseur de dégustation" → +0.25
+    if 'sous_types_bonus' in config:
+        sous_type_lower = df.get('sous_type', pd.Series(['']*len(df))).fillna('').str.lower()
+        for st in config['sous_types_bonus']:
+            mask_st = sous_type_lower.str.contains(st.lower(), regex=False, na=False)
+            scores = np.where(mask_st, np.minimum(scores + 0.25, 1.0), scores)
+
+    # ── Bonus type DATAtourisme pour le thème festivals ───────────────────────
+    # Les "Fête et manifestation" ont des noms très variés ("Soirée tartiflette",
+    # "Week-end des Grands Crus"...) qui ne matchent pas les keywords.
+    # On utilise directement le type DATAtourisme comme signal.
+    if theme == 'festivals' and 'type' in df.columns:
+        type_lower = df['type'].fillna('').str.lower()
+        mask_fete = type_lower.str.contains('fête et manifestation', regex=False, na=False)
+        scores = np.where(mask_fete, np.maximum(scores, 0.6), scores)
+
+    # ── Bonus type pour gastronomie : Produit (fournisseurs, producteurs) ──────
+    if theme == 'gastronomie' and 'type' in df.columns:
+        type_lower = df['type'].fillna('').str.lower()
+        mask_produit = type_lower.str.contains('produit', regex=False, na=False)
+        scores = np.where(mask_produit, np.minimum(scores + 0.2, 1.0), scores)
+
+    # ── Filtres d'exclusion GLOBAUX (tous thèmes) ────────────────────────────
+    # Certains POIs ne sont jamais des destinations touristiques pertinentes
+    # quel que soit le thème : golfs adultes, stations service, parkings...
+    nom_lower_global = df['nom'].fillna('').str.lower()
+
+    # Golfs adultes (tous thèmes sauf mini-golf)
+    mask_golf_global = (
+        nom_lower_global.str.contains('golf', regex=False, na=False) &
+        ~nom_lower_global.str.contains('mini', regex=False, na=False)
+    )
+    scores = np.where(mask_golf_global, np.minimum(scores * 0.1, 0.05), scores)
+
+    # ── Filtre d'exclusion : faux positifs thème famille ─────────────────────
+    # Le thème famille cible enfants et familles — exclure les activités adultes
+    if theme == 'famille':
+        # Autres exclusions adultes spécifiques famille
+        nom_lower_f = df['nom'].fillna('').str.lower()
+        EXCLUSIONS_FAMILLE = [
+            'casino', 'hippodrome', 'champ de course',
+            'stade de foot', 'stade municipal', 'country club',
+        ]
+        for excl in EXCLUSIONS_FAMILLE:
+            mask_excl_f = nom_lower_f.str.contains(excl, regex=False, na=False)
+            scores = np.where(mask_excl_f, np.minimum(scores * 0.2, 0.1), scores)
+
+    # ── Filtres spécifiques thème romantique ─────────────────────────────────
+    if theme == 'romantique':
+        EXCLUSIONS_ROMANTIQUE = [
+            'parc interdépartemental', 'parc départemental des sports',
+            'parc aventure', 'parcours acrobatique', 'accrobranche',
+            'karting', 'laser game', 'escape game',
+            'piscine municipale', 'centre aquatique',
+            'salle de sport', 'gymnase',
+        ]
+        nom_lower_r = df['nom'].fillna('').str.lower()
+        for excl in EXCLUSIONS_ROMANTIQUE:
+            mask_r = nom_lower_r.str.contains(excl, regex=False, na=False)
+            scores = np.where(mask_r, np.minimum(scores * 0.2, 0.1), scores)
+
+    # ── Filtre d'exclusion : faux positifs thème culture ─────────────────────
+    # DATAtourisme classe comme "Site culturel" des lieux trop génériques :
+    # paroisses, marchés couverts, médiathèques, bibliothèques de quartier...
+    # Ces lieux ne sont pas des destinations touristiques au sens strict.
+    # On réduit leur score pour les faire passer sous le seuil de sélection.
+    if theme == 'culture':
+        EXCLUSIONS_CULTURE = [
+            # Lieux de culte — intéressants historiquement mais pas des musées
+            'paroisse', 'église protestante', 'temple protestant', 'mosquée',
+            'synagogue', 'église saint-', 'église notre-', 'église sainte-',
+            'cathédrale saint-', 'chapelle saint-',
+            # Services culturels de quartier — pas des destinations touristiques
+            'médiathèque', 'bibliothèque municipale', 'bibliothèque de',
+            'centre culturel municipal', 'maison de quartier', 'centre social',
+            'mairie', 'hôtel de ville',
+            # Marchés et espaces commerciaux
+            'marché couvert', 'marché municipal', 'marché de',
+            'passage choiseul', 'passage verdeau', 'passage jouffroy',
+            # Espaces verts sans caractère muséal
+            'square ', 'moulin de',
+        ]
+        nom_lower = df['nom'].fillna('').str.lower()
+        for excl in EXCLUSIONS_CULTURE:
+            mask_excl = nom_lower.str.contains(excl, regex=False, na=False)
+            scores = np.where(mask_excl, np.minimum(scores * 0.3, 0.15), scores)
+
+    # ── Bonus qualité : fiches officielles DATAtourisme (UUID) ──────────────
+    # Stratégie en 3 niveaux basée sur sous_type + score keyword :
+    #
+    # Niveau 1 — officiel + sous_type visitable + 2 keywords → score 1.0
+    #   Ex: Louvre (Site culturel, officiel, matche "musée"+"art") → 1.0
+    #   Évite: Wecandoo (Visite, officiel, matche 1 seul keyword) → non éligible
+    #
+    # Niveau 2 — officiel + sous_type visitable + 1 keyword → 0.7
+    #   Ex: petit musée avec 1 seul mot-clé dans le nom
+    #
+    # Niveau 3 — officiel + sous_type non visitable → petit bonus 0.4 max
+    #   Ex: restaurant officiel (ne doit pas apparaître dans itinéraire culturel)
+    #
+    # Les sous_types visitables = vrais sites touristiques à visiter
+    # (pas restaurants, hôtels, commerces, services)
+    if 'est_officiel' in df.columns:
+        est_officiel = df['est_officiel'].fillna(False).values
+
+        SOUS_TYPES_VISITABLES = {
+            'site culturel',
+            'site sportif, récréatif et de loisirs',
+            'visite',
+            'site naturel',
+            'patrimoine culturel immatériel',
+        }
+        sous_type_lower = df.get('sous_type', pd.Series(['']*len(df))).fillna('').str.lower()
+        est_visitable = sous_type_lower.isin(SOUS_TYPES_VISITABLES).values
+
+        # Score > 0.20 = au moins 2 keywords matchés (0.15 × 2)
+        a_match_fort  = scores > 0.20
+        a_match_faible = (scores > 0.05) & ~a_match_fort
+
+        # Niveau 1 : officiel + visitable + fort match → 1.0
+        scores = np.where(est_officiel & est_visitable & a_match_fort,
+                          1.0, scores)
+        # Niveau 2 : officiel + visitable + faible match → 0.7
+        scores = np.where(est_officiel & est_visitable & a_match_faible,
+                          np.minimum(scores + 0.3, 0.7), scores)
+        # Niveau 3 : officiel + non visitable → petit bonus
+        scores = np.where(est_officiel & ~est_visitable,
+                          np.minimum(scores + 0.1, 0.4), scores)
+        scores = np.clip(scores, 0.0, 1.0)
+    else:
+        # Fallback : proxy fréquence si colonne absente (compatibilité)
+        ref = df_global if df_global is not None else df
+        nom_counts_global = _get_nom_counts_global(ref)
+        nom_counts = df['nom'].map(nom_counts_global).fillna(1)
+        max_count = nom_counts_global.max()
+        notoriete = np.log1p(nom_counts.values) / np.log1p(max_count) * 0.3
+        scores = np.clip(scores + notoriete, 0.0, 1.0)
+
     result = pd.Series(scores, index=df.index)
     if len(df) < 10000:
         _theme_scores[cache_key] = result
@@ -248,7 +454,7 @@ def filter_poi_by_theme(df_poi, theme, gare_lat, gare_lon, max_radius_km, verbos
     if len(idx) == 0:
         return pd.DataFrame()
     df = df.iloc[idx].copy()
-    df['theme_score'] = compute_theme_scores(df, theme)
+    df['theme_score'] = compute_theme_scores(df, theme, df_global=df_poi)
     max_score = df['theme_score'].max()
     threshold = 0.1 if max_score > 0.3 else 0.01 if max_score > 0.1 else 0.0
     df_filtered = df[df['theme_score'] >= threshold].copy()
